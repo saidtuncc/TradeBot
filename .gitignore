@@ -10,7 +10,6 @@ venv/
 ENV/
 
 # Data Files (large)
-*.csv
 USATECHIDXUSD60.csv
 trade_log.csv
 
