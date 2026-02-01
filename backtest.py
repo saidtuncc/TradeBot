@@ -1,6 +1,6 @@
 # backtest.py
-# System v0.7: Dynamic Position Management Engine
-# NASDAQ H1 Trend-Following with Pyramiding & Hedging
+# System v0.8: Data-Driven News Risk System
+# NASDAQ H1 Trend-Following with News Risk Scoring
 # Dependencies: pandas, numpy
 
 import pandas as pd
@@ -10,6 +10,8 @@ from typing import Optional, Tuple, List, Dict
 from dataclasses import dataclass, field
 from enum import Enum
 import config
+from news_manager import get_news_manager
+from ai_interface import get_intelligence_layer, SignalType
 
 # =============================================================================
 # DATA STRUCTURES
@@ -47,6 +49,8 @@ class TradeRecord:
     bars_held: int
     hedge_activated: bool
     scaled_in: bool
+    news_risk_score: float  # v0.8: Track risk score at entry
+    size_reduced: bool       # v0.8: Was position size reduced?
 
 # =============================================================================
 # POSITION MANAGER CLASS
@@ -54,8 +58,10 @@ class TradeRecord:
 
 class PositionManager:
     """
-    State machine for dynamic position management.
-    Handles pyramiding (scaling in) and hedging (risk neutralization).
+    State machine for position management.
+    
+    v0.8: Pyramiding and hedging methods are PRESERVED but DORMANT.
+    They require ENABLE_AI_WRAPPER = True to execute.
     """
     
     def __init__(self):
@@ -70,7 +76,7 @@ class PositionManager:
         self.entry_bar_idx: int = 0
         self.bars_held: int = 0
         
-        # Hedge state
+        # Hedge state (dormant)
         self.hedge_active: bool = False
         self.hedge_size: float = 0.0
         self.hedge_bars: int = 0
@@ -81,6 +87,10 @@ class PositionManager:
         self.hedge_was_activated: bool = False
         self.scaled_in: bool = False
         self.initial_entry_price: float = 0.0
+        
+        # v0.8: News risk tracking
+        self.entry_risk_score: float = 0.0
+        self.size_was_reduced: bool = False
     
     @property
     def is_open(self) -> bool:
@@ -115,7 +125,8 @@ class PositionManager:
         return len(self.layers)
     
     def open_position(self, direction: Direction, price: float, size: float, 
-                     atr: float, time: datetime, bar_idx: int) -> None:
+                     atr: float, time: datetime, bar_idx: int,
+                     risk_score: float = 0.0, size_reduced: bool = False) -> None:
         """Open a new position with initial layer."""
         self.reset()
         self.direction = direction
@@ -123,6 +134,8 @@ class PositionManager:
         self.initial_size = size
         self.initial_entry_price = price
         self.max_size_reached = size
+        self.entry_risk_score = risk_score
+        self.size_was_reduced = size_reduced
         
         # Create initial layer
         layer = Layer(
@@ -145,8 +158,12 @@ class PositionManager:
     def add_layer(self, price: float, size: float, atr: float, time: datetime) -> bool:
         """
         Add a scaling layer (pyramiding).
-        Returns True if layer was added, False if at max layers.
+        DORMANT: Requires PYRAMIDING_ENABLED = True AND ENABLE_AI_WRAPPER = True
         """
+        # Safety lock
+        if not config.PYRAMIDING_ENABLED or not config.ENABLE_AI_WRAPPER:
+            return False
+        
         if not self.is_open:
             return False
         
@@ -164,30 +181,31 @@ class PositionManager:
         self.scaled_in = True
         self.max_size_reached = max(self.max_size_reached, self.total_size)
         
-        # Move SL to break-even if configured
         if config.MOVE_SL_TO_BE_ON_SCALE:
-            self.update_sl_to_breakeven()
+            self._update_sl_to_breakeven()
         
         return True
     
-    def update_sl_to_breakeven(self) -> None:
+    def _update_sl_to_breakeven(self) -> None:
         """Move stop loss to break-even (average entry price)."""
         if self.direction == Direction.LONG:
-            # For long, SL can only move up
             new_sl = self.avg_entry_price
             if new_sl > self.current_sl:
                 self.current_sl = new_sl
-        else:  # SHORT
-            # For short, SL can only move down
+        else:
             new_sl = self.avg_entry_price
             if new_sl < self.current_sl:
                 self.current_sl = new_sl
     
     def activate_hedge(self) -> bool:
         """
-        Activate partial hedge to reduce exposure during volatility.
-        For netting simulation: reduces effective exposure.
+        Activate partial hedge.
+        DORMANT: Requires HEDGING_ENABLED = True AND ENABLE_AI_WRAPPER = True
         """
+        # Safety lock
+        if not config.HEDGING_ENABLED or not config.ENABLE_AI_WRAPPER:
+            return False
+        
         if self.hedge_active:
             return False
         
@@ -203,48 +221,14 @@ class PositionManager:
         self.hedge_size = 0.0
         self.hedge_bars = 0
     
-    def check_hedge_timeout(self) -> bool:
-        """Check if hedge has been active too long."""
-        if self.hedge_active:
-            self.hedge_bars += 1
-            if self.hedge_bars >= config.HEDGE_MAX_BARS:
-                return True
-        return False
-    
-    def calculate_unrealized_pnl(self, current_price: float) -> float:
-        """Calculate unrealized PnL based on current price."""
-        if not self.is_open:
-            return 0.0
-        
-        if self.direction == Direction.LONG:
-            price_change = current_price - self.avg_entry_price
-        else:
-            price_change = self.avg_entry_price - current_price
-        
-        return price_change * self.net_exposure
-    
-    def calculate_unrealized_pnl_in_atr(self, current_price: float, atr: float) -> float:
-        """Calculate unrealized PnL normalized by ATR."""
-        if not self.is_open or atr <= 0:
-            return 0.0
-        
-        if self.direction == Direction.LONG:
-            price_change = current_price - self.avg_entry_price
-        else:
-            price_change = self.avg_entry_price - current_price
-        
-        return price_change / atr
-    
     def close_position(self, exit_price: float, exit_time: datetime, 
                        exit_reason: str) -> TradeRecord:
         """Close entire position and return trade record."""
-        # Calculate final PnL (on net exposure, accounting for any hedge)
         if self.direction == Direction.LONG:
             price_change = exit_price - self.avg_entry_price
         else:
             price_change = self.avg_entry_price - exit_price
         
-        # PnL is based on net exposure (hedged portion doesn't contribute to PnL)
         pnl = price_change * self.net_exposure
         
         record = TradeRecord(
@@ -262,7 +246,9 @@ class PositionManager:
             exit_reason=exit_reason,
             bars_held=self.bars_held,
             hedge_activated=self.hedge_was_activated,
-            scaled_in=self.scaled_in
+            scaled_in=self.scaled_in,
+            news_risk_score=self.entry_risk_score,
+            size_reduced=self.size_was_reduced
         )
         
         self.reset()
@@ -301,90 +287,18 @@ def calculate_rsi(series: pd.Series, period: int) -> pd.Series:
     rsi = 100 - (100 / (1 + rs))
     return rsi
 
-def calculate_adx(high: pd.Series, low: pd.Series, close: pd.Series, period: int) -> Tuple[pd.Series, pd.Series, pd.Series]:
-    """
-    Calculate ADX (Average Directional Index) and +DI/-DI.
-    
-    Returns:
-        Tuple of (ADX, +DI, -DI)
-    """
-    # Calculate True Range
-    tr1 = high - low
-    tr2 = abs(high - close.shift(1))
-    tr3 = abs(low - close.shift(1))
-    true_range = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-    
-    # Calculate Directional Movement
-    up_move = high - high.shift(1)
-    down_move = low.shift(1) - low
-    
-    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0)
-    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0)
-    
-    plus_dm = pd.Series(plus_dm, index=high.index)
-    minus_dm = pd.Series(minus_dm, index=high.index)
-    
-    # Smoothed TR, +DM, -DM using Wilder's smoothing
-    atr = true_range.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    smooth_plus_dm = plus_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    smooth_minus_dm = minus_dm.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    
-    # Calculate +DI and -DI
-    plus_di = 100 * smooth_plus_dm / atr
-    minus_di = 100 * smooth_minus_dm / atr
-    
-    # Calculate DX
-    di_diff = abs(plus_di - minus_di)
-    di_sum = plus_di + minus_di
-    dx = 100 * di_diff / di_sum
-    
-    # Calculate ADX (smoothed DX)
-    adx = dx.ewm(alpha=1/period, min_periods=period, adjust=False).mean()
-    
-    return adx, plus_di, minus_di
-
 # =============================================================================
-# VOLATILITY ANOMALY DETECTION
-# =============================================================================
-
-def detect_candle_anomaly(candle_range: float, atr: float) -> bool:
-    """Detect if current candle is abnormally large."""
-    threshold = atr * config.CANDLE_ANOMALY_MULT
-    return candle_range > threshold
-
-def detect_atr_spike(atr: float, atr_avg: float) -> bool:
-    """Detect if ATR has spiked above normal levels."""
-    threshold = atr_avg * config.ATR_SPIKE_MULT
-    return atr > threshold
-
-def is_volatility_anomaly(row: pd.Series) -> Tuple[bool, str]:
-    """Combined volatility anomaly check."""
-    candle_range = row['high'] - row['low']
-    atr = row['atr14']
-    atr_avg = row['atr_avg']
-    
-    if detect_candle_anomaly(candle_range, atr):
-        return True, "candle_anomaly"
-    if detect_atr_spike(atr, atr_avg):
-        return True, "atr_spike"
-    return False, ""
-
-def should_trigger_hedge(candle_range: float, atr: float) -> bool:
-    """Check if volatility spike should trigger hedge (while in trade)."""
-    return candle_range > atr * config.HEDGE_TRIGGER_MULT
-
-def should_exit_hedge(candle_range: float, atr: float) -> bool:
-    """Check if volatility has subsided enough to exit hedge."""
-    return candle_range < atr * config.HEDGE_EXIT_MULT
-
-# =============================================================================
-# BACKTESTING ENGINE v0.7
+# BACKTESTING ENGINE v0.8
 # =============================================================================
 
 class Backtester:
     """
-    Event-driven backtester with dynamic position management.
-    Supports pyramiding (scaling in) and hedging (risk neutralization).
+    Event-driven backtester with data-driven news risk scoring.
+    
+    v0.8 Features:
+    - Baseline v0.6 entry logic (EMA50 + RSI + ATR)
+    - News Risk Score for position sizing
+    - Pyramiding/hedging methods preserved but dormant
     """
     
     def __init__(self, data: pd.DataFrame, initial_capital: float = None):
@@ -399,12 +313,18 @@ class Backtester:
         
         # Statistics
         self.stats = {
-            'anomaly_bars': 0,
-            'entry_blocks': 0,
-            'scale_ins': 0,
-            'hedges_activated': 0,
-            'hedge_timeouts': 0
+            'total_bars': 0,
+            'entry_signals': 0,
+            'news_blocks': 0,
+            'size_reductions': 0,
+            'normal_entries': 0
         }
+        
+        # Initialize news manager
+        self.news_manager = get_news_manager()
+        
+        # Initialize AI layer (dormant)
+        self.ai_layer = get_intelligence_layer()
         
         self._prepare_data()
     
@@ -416,20 +336,11 @@ class Backtester:
             df['datetime'] = pd.to_datetime(df['datetime'])
             df.set_index('datetime', inplace=True)
         
-        # Core indicators
+        # Core indicators (v0.6 baseline)
         df['ema50'] = calculate_ema(df['close'], config.EMA_PERIOD)
         df['atr14'] = calculate_atr(df['high'], df['low'], df['close'], config.ATR_PERIOD)
         df['atr_avg'] = df['atr14'].rolling(window=config.ATR_AVG_PERIOD).mean()
         df['rsi14'] = calculate_rsi(df['close'], config.RSI_PERIOD)
-        
-        # ADX (NEW)
-        df['adx'], df['plus_di'], df['minus_di'] = calculate_adx(
-            df['high'], df['low'], df['close'], config.ADX_PERIOD
-        )
-        df['adx_rising'] = df['adx'] > df['adx'].shift(1)
-        
-        # Candle range for volatility checks
-        df['candle_range'] = df['high'] - df['low']
         
         self.data = df.dropna()
     
@@ -459,22 +370,17 @@ class Backtester:
     
     def _check_entry_conditions(self, row: pd.Series) -> Optional[Direction]:
         """
-        Check if entry conditions are met.
-        Includes ADX chop filter.
+        Check v0.6 baseline entry conditions.
+        EMA50 + RSI + ATR filter.
         """
         close = row['close']
         ema50 = row['ema50']
         rsi = row['rsi14']
         atr = row['atr14']
         atr_avg = row['atr_avg']
-        adx = row['adx']
         
         # Minimum volatility filter
         if atr < config.ATR_FILTER_RATIO * atr_avg:
-            return None
-        
-        # ADX Chop Filter (NEW) - Do not enter choppy markets
-        if adx < config.ADX_MIN_THRESHOLD:
             return None
         
         # Long conditions
@@ -489,51 +395,8 @@ class Backtester:
         
         return None
     
-    def _check_scaling_conditions(self, row: pd.Series) -> bool:
-        """
-        Check if we should add a scaling layer (pyramid).
-        
-        Conditions:
-        1. Position is open and profitable
-        2. Unrealized profit > SCALE_IN_PROFIT_ATR × ATR
-        3. ADX is rising (trend strengthening)
-        4. Not at max layers
-        5. Hedge is not active
-        """
-        if not config.PYRAMIDING_ENABLED:
-            return False
-        
-        if not self.position.is_open:
-            return False
-        
-        if self.position.hedge_active:
-            return False
-        
-        if self.position.num_layers >= config.MAX_LAYERS:
-            return False
-        
-        # Check profit threshold
-        profit_atr = self.position.calculate_unrealized_pnl_in_atr(
-            row['close'], row['atr14']
-        )
-        if profit_atr <= config.SCALE_IN_PROFIT_ATR:
-            return False
-        
-        # Check ADX is rising
-        if not row['adx_rising']:
-            return False
-        
-        # ADX should be showing strong trend
-        if row['adx'] < config.ADX_STRONG_TREND:
-            return False
-        
-        return True
-    
     def _check_exit_conditions(self, row: pd.Series) -> Tuple[bool, str, float]:
-        """
-        Check if position should be exited.
-        Returns: (should_exit, reason, exit_price)
-        """
+        """Check if position should be exited."""
         if not self.position.is_open:
             return False, "", 0.0
         
@@ -550,62 +413,31 @@ class Backtester:
                 return True, "stop_loss", pos.current_sl
             if high >= pos.current_tp:
                 return True, "take_profit", pos.current_tp
-        else:  # SHORT
+        else:
             if high >= pos.current_sl:
                 return True, "stop_loss", pos.current_sl
             if low <= pos.current_tp:
                 return True, "take_profit", pos.current_tp
         
         # Time-based exit
-        max_bars = config.HIGH_VOL_MAX_BARS if pos.hedge_active else config.MAX_BARS_IN_TRADE
-        if pos.bars_held >= max_bars:
+        if pos.bars_held >= config.MAX_BARS_IN_TRADE:
             return True, "time_exit", close
         
         return False, "", 0.0
     
-    def _manage_position(self, row: pd.Series, time: datetime, bar_idx: int):
-        """
-        Main position management logic.
-        Handles scaling, hedging, and exits.
-        """
-        if not self.position.is_open:
-            return
-        
-        pos = self.position
-        candle_range = row['candle_range']
-        atr = row['atr14']
-        
-        # === HEDGE MANAGEMENT ===
-        if config.HEDGING_ENABLED:
-            # Check if we should activate hedge (volatility spike while in trade)
-            if not pos.hedge_active and should_trigger_hedge(candle_range, atr):
-                pos.activate_hedge()
-                self.stats['hedges_activated'] += 1
-            
-            # Check if we should deactivate hedge (volatility subsided)
-            elif pos.hedge_active:
-                if should_exit_hedge(candle_range, atr):
-                    pos.deactivate_hedge()
-                elif pos.check_hedge_timeout():
-                    pos.deactivate_hedge()
-                    self.stats['hedge_timeouts'] += 1
-        
-        # === SCALING MANAGEMENT ===
-        if self._check_scaling_conditions(row):
-            scale_size = pos.initial_size * config.SCALE_IN_SIZE_RATIO
-            if pos.add_layer(row['close'], scale_size, atr, time):
-                self.stats['scale_ins'] += 1
-    
     def run(self) -> Dict:
-        """Run the backtest with dynamic position management."""
-        print("Starting backtest v0.7 (Dynamic Position Management)...")
+        """Run the backtest with news risk scoring."""
+        print("Starting backtest v0.8 (Data-Driven News Risk)...")
         print(f"Data range: {self.data.index[0]} to {self.data.index[-1]}")
         print(f"Total bars: {len(self.data)}")
-        print(f"Pyramiding: {'ENABLED' if config.PYRAMIDING_ENABLED else 'DISABLED'}")
-        print(f"Hedging: {'ENABLED' if config.HEDGING_ENABLED else 'DISABLED'}")
+        print(f"News Filter: {'ENABLED' if config.ENABLE_NEWS_FILTER else 'DISABLED'}")
+        print(f"AI Wrapper: {'ENABLED' if config.ENABLE_AI_WRAPPER else 'DISABLED'}")
+        print(f"Pyramiding: {'ENABLED' if config.PYRAMIDING_ENABLED else 'DORMANT'}")
+        print(f"Hedging: {'ENABLED' if config.HEDGING_ENABLED else 'DORMANT'}")
         print("-" * 50)
         
         for bar_idx, (time, row) in enumerate(self.data.iterrows()):
+            self.stats['total_bars'] += 1
             self._check_daily_reset(time)
             
             # Skip if stopped for day
@@ -619,17 +451,8 @@ class Backtester:
                         self.daily_pnl += record.pnl
                 continue
             
-            # Check volatility anomaly
-            is_anomaly, anomaly_reason = is_volatility_anomaly(row)
-            if is_anomaly:
-                self.stats['anomaly_bars'] += 1
-            
             # === MANAGE EXISTING POSITION ===
             if self.position.is_open:
-                # Position management (scaling, hedging)
-                self._manage_position(row, time, bar_idx)
-                
-                # Check exits
                 should_exit, reason, exit_price = self._check_exit_conditions(row)
                 if should_exit:
                     record = self.position.close_position(exit_price, time, reason)
@@ -640,21 +463,41 @@ class Backtester:
             
             # === CHECK FOR NEW ENTRY ===
             if not self.position.is_open and not self.stopped_for_day:
-                # Block new entries during volatility anomaly (if filter enabled)
-                if config.VOLATILITY_FILTER_ENABLED and is_anomaly:
-                    self.stats['entry_blocks'] += 1
-                    continue
-                
                 direction = self._check_entry_conditions(row)
+                
                 if direction:
-                    size = self._calculate_position_size(row['atr14'])
+                    self.stats['entry_signals'] += 1
+                    
+                    # === NEWS RISK SCORING (v0.8) ===
+                    risk_score = self.news_manager.calculate_risk_score(time)
+                    
+                    # HIGH RISK: Block entry
+                    if risk_score >= config.NEWS_RISK_THRESHOLD_HIGH:
+                        self.stats['news_blocks'] += 1
+                        continue
+                    
+                    # Calculate position size
+                    base_size = self._calculate_position_size(row['atr14'])
+                    size_reduced = False
+                    
+                    # MEDIUM RISK: Reduce position size 50%
+                    if risk_score >= config.NEWS_RISK_THRESHOLD_MED:
+                        base_size *= 0.5
+                        size_reduced = True
+                        self.stats['size_reductions'] += 1
+                    else:
+                        self.stats['normal_entries'] += 1
+                    
+                    # Open position
                     self.position.open_position(
                         direction=direction,
                         price=row['close'],
-                        size=size,
+                        size=base_size,
                         atr=row['atr14'],
                         time=time,
-                        bar_idx=bar_idx
+                        bar_idx=bar_idx,
+                        risk_score=risk_score,
+                        size_reduced=size_reduced
                     )
         
         # Close any remaining position
@@ -678,8 +521,7 @@ class Backtester:
         pnls = [t.pnl for t in self.trade_records]
         winning_trades = [t for t in self.trade_records if t.pnl > 0]
         losing_trades = [t for t in self.trade_records if t.pnl < 0]
-        scaled_trades = [t for t in self.trade_records if t.scaled_in]
-        hedged_trades = [t for t in self.trade_records if t.hedge_activated]
+        reduced_trades = [t for t in self.trade_records if t.size_reduced]
         
         total_return = (self.capital - self.initial_capital) / self.initial_capital * 100
         
@@ -703,7 +545,6 @@ class Backtester:
             sharpe = 0
         
         avg_bars = np.mean([t.bars_held for t in self.trade_records])
-        avg_layers = np.mean([t.num_layers for t in self.trade_records])
         
         winning_pnls = [t.pnl for t in winning_trades]
         losing_pnls = [t.pnl for t in losing_trades]
@@ -721,9 +562,7 @@ class Backtester:
             "avg_loss": np.mean(losing_pnls) if losing_pnls else 0,
             "profit_factor": abs(sum(winning_pnls) / sum(losing_pnls)) if losing_pnls else float('inf'),
             "avg_bars_in_trade": avg_bars,
-            "avg_layers_per_trade": avg_layers,
-            "trades_with_scaling": len(scaled_trades),
-            "trades_with_hedge": len(hedged_trades),
+            "trades_with_reduced_size": len(reduced_trades),
             "exit_reasons": self._count_exit_reasons(),
             **self.stats
         }
@@ -745,18 +584,14 @@ class Backtester:
                 "entry_time": t.entry_time,
                 "exit_time": t.exit_time,
                 "direction": t.direction,
-                "initial_entry": t.initial_entry_price,
-                "avg_entry": t.avg_entry_price,
+                "entry_price": t.initial_entry_price,
                 "exit_price": t.exit_price,
-                "initial_size": t.initial_size,
-                "max_size": t.max_size,
-                "final_size": t.final_size,
-                "num_layers": t.num_layers,
+                "size": t.initial_size,
                 "pnl": t.pnl,
                 "exit_reason": t.exit_reason,
                 "bars_held": t.bars_held,
-                "scaled_in": t.scaled_in,
-                "hedge_activated": t.hedge_activated
+                "news_risk_score": t.news_risk_score,
+                "size_reduced": t.size_reduced
             })
         return pd.DataFrame(records)
 
@@ -806,7 +641,7 @@ def load_csv_data(filepath: str = "USATECHIDXUSD60.csv") -> pd.DataFrame:
 
 def validate_data(df: pd.DataFrame) -> bool:
     """Validate data is suitable for backtesting."""
-    min_required = max(config.EMA_PERIOD, config.ATR_PERIOD, config.RSI_PERIOD, config.ADX_PERIOD) + config.ATR_AVG_PERIOD + 100
+    min_required = max(config.EMA_PERIOD, config.ATR_PERIOD, config.RSI_PERIOD) + config.ATR_AVG_PERIOD + 100
     if len(df) < min_required:
         print(f"Not enough data: {len(df)} rows (need {min_required})")
         return False
@@ -818,10 +653,10 @@ def validate_data(df: pd.DataFrame) -> bool:
 # =============================================================================
 
 def main():
-    """Run backtest with dynamic position management."""
+    """Run backtest with data-driven news risk scoring."""
     print("=" * 70)
-    print("NASDAQ H1 Trading System v0.7")
-    print("Dynamic Position Management: Pyramiding + Hedging")
+    print("NASDAQ H1 Trading System v0.8")
+    print("Data-Driven News Risk System")
     print("=" * 70)
     
     print("\n📂 LOADING DATA:")
@@ -865,17 +700,15 @@ def main():
     print(f"   Sharpe Ratio: {metrics['sharpe_ratio']:.2f}")
     print(f"   Profit Factor: {metrics['profit_factor']:.2f}")
     
-    print(f"\n📈 POSITION MANAGEMENT:")
-    print(f"   Avg Bars in Trade: {metrics['avg_bars_in_trade']:.1f}")
-    print(f"   Avg Layers per Trade: {metrics['avg_layers_per_trade']:.2f}")
-    print(f"   Trades with Scaling: {metrics['trades_with_scaling']}")
-    print(f"   Trades with Hedge: {metrics['trades_with_hedge']}")
+    print(f"\n📰 NEWS RISK STATISTICS:")
+    print(f"   Entry Signals: {metrics['entry_signals']}")
+    print(f"   Blocked (High Risk): {metrics['news_blocks']}")
+    print(f"   Reduced Size (Med Risk): {metrics['size_reductions']}")
+    print(f"   Normal Entries: {metrics['normal_entries']}")
+    print(f"   Trades with Reduced Size: {metrics['trades_with_reduced_size']}")
     
-    print(f"\n🔥 FILTER STATISTICS:")
-    print(f"   Anomaly Bars: {metrics['anomaly_bars']}")
-    print(f"   Entry Blocks: {metrics['entry_blocks']}")
-    print(f"   Scale-Ins Executed: {metrics['scale_ins']}")
-    print(f"   Hedges Activated: {metrics['hedges_activated']}")
+    print(f"\n⏱️ TRADE DURATION:")
+    print(f"   Avg Bars in Trade: {metrics['avg_bars_in_trade']:.1f}")
     
     print(f"\n🚪 EXIT REASONS:")
     for reason, count in metrics['exit_reasons'].items():
