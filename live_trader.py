@@ -271,11 +271,13 @@ class LiveTrader:
         logger.info("  Cycle: every 30 seconds")
 
         if self.telegram:
+            self.telegram.set_trader(self)
             self.telegram.notify_startup(
                 self.connector.symbol,
                 "DRY RUN" if self.dry_run else "LIVE",
                 bool(self.predictor)
             )
+            self.telegram.start_polling()
 
         try:
             while True:
