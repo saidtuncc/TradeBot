@@ -1,17 +1,21 @@
 # live_trader.py
 """
-MT5 Live Trader — Connects ML models to MetaTrader 5 for automated trading.
-Runs on Windows VPS. Checks every H1 bar close for ML signals.
+MT5 Multi-Timeframe Live Trader v2.0
+Real-time continuous analysis across H1/M15/M5 timeframes.
+
+Architecture:
+  H1  → Strategic direction (ML model, 32 features)
+  M15 → Tactical entry/exit (RSI, momentum confirmation)
+  M5  → Real-time position management (smart exits)
 
 Usage:
-    python live_trader.py              # Run with default settings
-    python live_trader.py --dry-run    # Log signals without placing orders
+    python live_trader.py              # Live trading
+    python live_trader.py --dry-run    # Simulation mode
 """
 
 import os
 import sys
 import time
-import json
 import logging
 import argparse
 from datetime import datetime, timedelta
@@ -32,25 +36,18 @@ logging.basicConfig(
 logger = logging.getLogger('live_trader')
 
 # ─── Configuration ───────────────────────────────────────────────────────────
+MT5_LOGIN = 0
+MT5_PASSWORD = ""
+MT5_SERVER = ""
+MT5_PATH = None
 
-# MT5 connection (update these with your demo account details)
-MT5_LOGIN = 0           # Your MT5 login number
-MT5_PASSWORD = ""       # Your MT5 password
-MT5_SERVER = ""         # Your MT5 server name
-MT5_PATH = None         # Path to MT5 terminal.exe (auto-detect if None)
+SYMBOL = "USATECHIDXUSD"
+VOLUME = 0.10
+LOOKBACK_BARS = 200
 
-# Trading
-SYMBOL = "USATECHIDXUSD"   # MT5 symbol name (check your broker's name)
-TIMEFRAME_H1 = None         # Set after MT5 import
-VOLUME = 0.10               # Minimum lot for NASDAQ CFD
-CHECK_INTERVAL_SEC = 60     # Check every 60 seconds
-LOOKBACK_BARS = 200         # Bars to fetch for feature calculation
-
-# Mapping of config -> MT5 symbol alternatives
 SYMBOL_ALTERNATIVES = [
     "US100Cash", "US100", "USATECHIDXUSD", "USTEC", "NAS100",
     "NASDAQ", "Nasdaq", "US100.cash", "#NAS100", "NAS100.cash",
-    "GerTech30Cash", "US100-MAR26",
 ]
 
 
@@ -68,7 +65,6 @@ class MT5Connector:
         self.symbol = None
 
     def connect(self) -> bool:
-        """Initialize connection to MT5 terminal."""
         kwargs = {}
         if self.path:
             kwargs['path'] = self.path
@@ -92,7 +88,6 @@ class MT5Connector:
         return True
 
     def find_symbol(self) -> Optional[str]:
-        """Find the correct symbol name on this broker."""
         for sym in SYMBOL_ALTERNATIVES:
             info = self.mt5.symbol_info(sym)
             if info is not None:
@@ -106,40 +101,17 @@ class MT5Connector:
         return None
 
     def get_bars(self, timeframe, count: int) -> Optional[pd.DataFrame]:
-        """Fetch OHLCV bars from MT5."""
         rates = self.mt5.copy_rates_from_pos(self.symbol, timeframe, 0, count)
         if rates is None or len(rates) == 0:
-            logger.warning("No bars returned for %s", self.symbol)
             return None
-
         df = pd.DataFrame(rates)
         df['datetime'] = pd.to_datetime(df['time'], unit='s')
         df.rename(columns={'tick_volume': 'volume'}, inplace=True)
         return df[['datetime', 'open', 'high', 'low', 'close', 'volume']]
 
-    def get_position(self) -> Optional[Dict]:
-        """Get current open position for our symbol."""
-        positions = self.mt5.positions_get(symbol=self.symbol)
-        if positions and len(positions) > 0:
-            pos = positions[0]
-            return {
-                'ticket': pos.ticket,
-                'type': 'long' if pos.type == 0 else 'short',
-                'volume': pos.volume,
-                'price_open': pos.price_open,
-                'sl': pos.sl,
-                'tp': pos.tp,
-                'profit': pos.profit,
-                'time': datetime.fromtimestamp(pos.time),
-            }
-        return None
-
-    def place_order(self, direction: str, volume: float,
-                    sl: float, tp: float) -> bool:
-        """Place a market order with SL/TP."""
+    def place_order(self, direction: str, volume: float, sl: float, tp: float) -> bool:
         symbol_info = self.mt5.symbol_info(self.symbol)
         if symbol_info is None:
-            logger.error("Symbol info not available")
             return False
 
         if direction == 'long':
@@ -149,13 +121,11 @@ class MT5Connector:
             order_type = self.mt5.ORDER_TYPE_SELL
             price = self.mt5.symbol_info_tick(self.symbol).bid
 
-        # Round to symbol precision
         digits = symbol_info.digits
         price = round(price, digits)
         sl = round(sl, digits)
         tp = round(tp, digits)
-        
-        # Enforce broker's volume constraints
+
         vol_min = symbol_info.volume_min
         vol_step = symbol_info.volume_step
         volume = max(volume, vol_min)
@@ -167,11 +137,10 @@ class MT5Connector:
             "volume": volume,
             "type": order_type,
             "price": price,
-            "sl": sl,
-            "tp": tp,
+            "sl": sl, "tp": tp,
             "deviation": 20,
             "magic": 20260312,
-            "comment": f"TradeBot ML {direction.upper()}",
+            "comment": f"TradeBot {direction.upper()}",
             "type_time": self.mt5.ORDER_TIME_GTC,
             "type_filling": self.mt5.ORDER_FILLING_IOC,
         }
@@ -180,26 +149,24 @@ class MT5Connector:
         if result is None:
             logger.error("Order send failed: %s", self.mt5.last_error())
             return False
-
         if result.retcode != self.mt5.TRADE_RETCODE_DONE:
             logger.error("Order rejected: %s (code=%d)", result.comment, result.retcode)
             return False
 
-        logger.info("✅ ORDER EXECUTED: %s %.2f lots @ %.2f | SL=%.2f TP=%.2f | ticket=%d",
+        logger.info("✅ ORDER: %s %.2f lots @ %.2f | SL=%.2f TP=%.2f | ticket=%d",
                      direction.upper(), volume, price, sl, tp, result.order)
         return True
 
     def close_position(self, ticket: int) -> bool:
-        """Close position by ticket."""
         pos = self.mt5.positions_get(ticket=ticket)
         if not pos:
             return False
         pos = pos[0]
 
-        if pos.type == 0:  # Long → sell to close
+        if pos.type == 0:
             order_type = self.mt5.ORDER_TYPE_SELL
             price = self.mt5.symbol_info_tick(self.symbol).bid
-        else:  # Short → buy to close
+        else:
             order_type = self.mt5.ORDER_TYPE_BUY
             price = self.mt5.symbol_info_tick(self.symbol).ask
 
@@ -219,7 +186,7 @@ class MT5Connector:
 
         result = self.mt5.order_send(request)
         if result and result.retcode == self.mt5.TRADE_RETCODE_DONE:
-            logger.info("✅ POSITION CLOSED: ticket=%d profit=%.2f", ticket, pos.profit)
+            logger.info("✅ CLOSED: ticket=%d profit=%.2f", ticket, pos.profit)
             return True
         logger.error("Close failed: %s", result.comment if result else "None")
         return False
@@ -229,31 +196,47 @@ class MT5Connector:
         self.connected = False
 
 
+# ═══════════════════════════════════════════════════════════════════════════════
+# MULTI-TIMEFRAME LIVE TRADER
+# ═══════════════════════════════════════════════════════════════════════════════
+
 class LiveTrader:
-    """Main live trading loop: fetch bars → compute features → ML predict → trade."""
+    """
+    Multi-TF Real-Time Trading Engine v2.0
+
+    H1  → Strategic direction (ML model)
+    M15 → Tactical entry/exit (RSI + momentum confirmation)
+    M5  → Position management (real-time smart exits)
+
+    Checks every 30 seconds. No daily trade limit.
+    """
 
     def __init__(self, connector: MT5Connector, dry_run: bool = False):
         self.connector = connector
         self.dry_run = dry_run
-        self.last_bar_time = None
         self.trade_count = 0
-        self.daily_pnl = 0.0
         self.current_day = None
 
-        # Load ML predictor (LightGBM only, skip LSTM for RAM)
+        # Track last bar times per timeframe
+        self.last_bar_times = {}
+
+        # H1 strategic state
+        self.h1_direction = None
+        self.h1_probability = 0.0
+        self.h1_signal_time = None
+
+        # Load ML predictor
         self.predictor = None
         try:
             from ml.predictor import get_predictor
             self.predictor = get_predictor()
             if self.predictor and self.predictor.loaded:
-                logger.info("ML Predictor loaded: ✅")
+                logger.info("ML Predictor: ✅")
             else:
-                logger.warning("ML Predictor not loaded — will use rule-based only")
                 self.predictor = None
         except Exception as e:
-            logger.error("ML Predictor init error: %s", e)
+            logger.error("ML Predictor error: %s", e)
 
-        # Load config
         import config
         self.config = config
 
@@ -265,149 +248,185 @@ class LiveTrader:
             self.news_mgr.refresh_events(force=True)
             logger.info("Live Calendar: ✅")
         except Exception as e:
-            logger.warning("Live Calendar not available: %s", e)
+            logger.warning("Calendar unavailable: %s", e)
 
     def run(self):
-        """Main loop: check every minute, trade on new H1 bar."""
+        """Continuous multi-TF analysis every 30 seconds."""
         import MetaTrader5 as mt5
+        self.mt5 = mt5
 
-        logger.info("═══ Live Trader Started ═══")
+        logger.info("═══ Multi-TF Live Trader v2.0 ═══")
         logger.info("  Symbol: %s", self.connector.symbol)
-        logger.info("  Mode: %s", "DRY RUN (no real orders)" if self.dry_run else "LIVE")
+        logger.info("  Mode: %s", "DRY RUN" if self.dry_run else "🔴 LIVE")
         logger.info("  ML: %s", "Active" if self.predictor else "Disabled")
-        logger.info("  Checking every %d seconds for new H1 bar...", CHECK_INTERVAL_SEC)
+        logger.info("  Timeframes: H1 (strategy) + M15 (entry) + M5 (management)")
+        logger.info("  Cycle: every 30 seconds")
 
         try:
             while True:
                 try:
-                    self._tick(mt5)
+                    self._run_cycle()
                 except KeyboardInterrupt:
                     raise
                 except Exception as e:
-                    logger.error("Tick error: %s", e, exc_info=True)
-
-                time.sleep(CHECK_INTERVAL_SEC)
-
+                    logger.error("Cycle error: %s", e, exc_info=True)
+                time.sleep(30)
         except KeyboardInterrupt:
             logger.info("Shutting down...")
         finally:
             self.connector.disconnect()
-            logger.info("═══ Live Trader Stopped ═══")
+            logger.info("═══ Trader Stopped ═══")
 
-    def _tick(self, mt5):
-        """Single tick: manage positions, check for new bar, evaluate, trade."""
-        # Get latest bars
-        bars = self.connector.get_bars(mt5.TIMEFRAME_H1, LOOKBACK_BARS)
-        if bars is None or len(bars) < 50:
-            return
-
-        # ─── Position Management (every tick) ─────────────────────────────
-        positions = self._get_all_positions()
-        self._manage_positions(positions, bars, mt5)
-
-        # ─── New Bar Check ────────────────────────────────────────────────
-        completed_bar = bars.iloc[-2]
-        completed_time = completed_bar['datetime']
-
-        if self.last_bar_time is not None and completed_time <= self.last_bar_time:
-            return  # No new bar yet
-
-        self.last_bar_time = completed_time
+    def _run_cycle(self):
+        """One analysis cycle across all timeframes."""
+        mt5 = self.mt5
         now = datetime.now()
 
         # Daily reset
         today = now.date()
         if self.current_day != today:
             self.current_day = today
-            self.daily_pnl = 0.0
             self.trade_count = 0
-            logger.info("── New day: %s ──", today)
+            logger.info("═══ New day: %s ═══", today)
 
-        logger.info("New H1 bar: %s | C=%.2f H=%.2f L=%.2f",
-                     completed_time, completed_bar['close'],
-                     completed_bar['high'], completed_bar['low'])
+        # Fetch all timeframe data
+        h1_bars = self.connector.get_bars(mt5.TIMEFRAME_H1, LOOKBACK_BARS)
+        m15_bars = self.connector.get_bars(mt5.TIMEFRAME_M15, 100)
+        m5_bars = self.connector.get_bars(mt5.TIMEFRAME_M5, 60)
 
-        # Log open positions
-        if positions:
-            for pos in positions:
-                logger.info("  📌 %s %.2f lots, P&L=$%.2f (ticket=%d)",
-                             pos['type'].upper(), pos['volume'],
-                             pos['profit'], pos['ticket'])
-
-        # ─── Daily loss limit ────────────────────────────────────────────
-        account = mt5.account_info()
-        if account:
-            daily_limit = account.balance * self.config.MAX_DAILY_LOSS
-            if self.daily_pnl <= -daily_limit:
-                logger.warning("  ⛔ Daily loss limit reached ($%.2f)", self.daily_pnl)
-                return
-
-        # ─── Check if we can open more positions ─────────────────────────
-        max_pos = self.config.MAX_CONCURRENT_POSITIONS
-        if len(positions) >= max_pos:
-            logger.info("  Max positions reached (%d/%d)", len(positions), max_pos)
+        if h1_bars is None or len(h1_bars) < 50:
             return
 
-        # ─── ML Signal Generation ────────────────────────────────────────
-        direction, probability = self._get_ml_signal(bars)
+        positions = self._get_all_positions()
 
-        if direction is None:
-            logger.info("  No ML signal")
-            return
+        # 1. Position management (every cycle, M5-based)
+        self._manage_positions(positions, h1_bars, m5_bars, now)
 
-        logger.info("  📊 ML SIGNAL: %s (prob=%.3f)", direction.upper(), probability)
+        # 2. H1 strategic analysis (on new H1 bar)
+        h1_time = h1_bars.iloc[-2]['datetime']
+        if self._is_new_bar('H1', h1_time):
+            self._analyze_h1(h1_bars, now)
 
-        # ─── News Check ──────────────────────────────────────────────────
+        # 3. M15 tactical analysis (on new M15 bar)
+        if m15_bars is not None and len(m15_bars) > 20:
+            m15_time = m15_bars.iloc[-2]['datetime']
+            if self._is_new_bar('M15', m15_time):
+                # Refresh positions (may have changed during management)
+                positions = self._get_all_positions()
+                self._analyze_m15(m15_bars, h1_bars, positions, now)
+
+    def _is_new_bar(self, tf: str, bar_time) -> bool:
+        last = self.last_bar_times.get(tf)
+        if last is not None and bar_time <= last:
+            return False
+        self.last_bar_times[tf] = bar_time
+        return True
+
+    # ═══════════════════════════════════════════════════════════════════
+    # H1 STRATEGIC ANALYSIS
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _analyze_h1(self, h1_bars, now):
+        """H1 bar closed → full ML analysis, set strategic direction."""
+        bar = h1_bars.iloc[-2]
+        logger.info("📊 H1 BAR: %s | C=%.2f H=%.2f L=%.2f",
+                     bar['datetime'], bar['close'], bar['high'], bar['low'])
+
+        direction, probability = self._get_ml_signal(h1_bars)
+
+        if direction:
+            self.h1_direction = direction
+            self.h1_probability = probability
+            self.h1_signal_time = now
+            logger.info("  🎯 H1 DIRECTION: %s (prob=%.3f)", direction.upper(), probability)
+        else:
+            self.h1_direction = None
+            self.h1_probability = 0.0
+            logger.info("  H1: No clear direction")
+
+    # ═══════════════════════════════════════════════════════════════════
+    # M15 TACTICAL ENTRY/EXIT
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _analyze_m15(self, m15_bars, h1_bars, positions, now):
+        """M15 bar closed → entry/exit timing based on H1 strategy."""
+        bar = m15_bars.iloc[-2]
+        close = float(bar['close'])
+
+        # M15 indicators
+        m15_rsi = self._calc_rsi(m15_bars['close'], 14)
+        m15_mom = (close / float(m15_bars.iloc[-6]['close']) - 1) * 100 if len(m15_bars) > 6 else 0
+
+        logger.info("  M15: C=%.2f RSI=%.1f Mom=%.2f%%", close, m15_rsi, m15_mom)
+
+        # News check
         news_scale = 1.0
         if self.news_mgr:
             score, events = self.news_mgr.calculate_risk_score()
-            logger.info("  %s", self.news_mgr.get_status_line())
-
             if score >= 7.0:
-                # HIGH risk: only block if event is UPCOMING (not past)
-                future_events = [e for e in events
-                                if (e.timestamp - now).total_seconds() > 0]
-                if future_events:
-                    logger.warning("  ⏳ NEWS WAIT: %s in %.1fh — waiting for post-event",
-                                    future_events[0].name,
-                                    (future_events[0].timestamp - now).total_seconds() / 3600)
+                future = [e for e in events if (e.timestamp - now).total_seconds() > 0]
+                if future:
+                    logger.info("  ⏳ News wait: %s in %.1fh",
+                                 future[0].name,
+                                 (future[0].timestamp - now).total_seconds() / 3600)
                     return
                 else:
-                    # Event just passed → volatility play! Trade with the move
-                    logger.info("  🔥 POST-NEWS: Event passed, trading momentum")
-                    news_scale = 1.0  # Full size on post-event momentum
+                    logger.info("  🔥 Post-news momentum")
             elif score >= 4.0:
                 news_scale = 0.5
-                logger.info("  ⚠️ NEWS NEARBY: score=%.1f — half volume", score)
 
-        # ─── Check if this is a pyramid or new trade ─────────────────────
-        same_direction_pos = [p for p in positions if p['type'] == direction]
-        opposite_pos = [p for p in positions if p['type'] != direction]
-
-        # Don't open opposite direction while positions exist
-        if opposite_pos:
-            logger.info("  Opposite position open — skipping %s signal", direction.upper())
+        # Need H1 direction
+        if self.h1_direction is None:
             return
 
-        # Pyramiding check
-        is_pyramid = len(same_direction_pos) > 0
-        if is_pyramid:
-            if not self._should_pyramid(same_direction_pos, bars, direction, probability):
-                return
+        # Max positions check
+        if len(positions) >= self.config.MAX_CONCURRENT_POSITIONS:
+            return
 
-        # ─── Calculate SL/TP/Volume ──────────────────────────────────────
-        atr = self._calculate_atr(bars)
+        direction = self.h1_direction
+        probability = self.h1_probability
+
+        # M15 confirmation
+        confirmed = False
+        if direction == 'long':
+            if 35 < m15_rsi < 75 and m15_mom > -0.1:
+                confirmed = True
+        else:
+            if 25 < m15_rsi < 65 and m15_mom < 0.1:
+                confirmed = True
+
+        if not confirmed:
+            logger.info("  M15 not confirming %s", direction.upper())
+            return
+
+        # Direction safety
+        opposite = [p for p in positions if p['type'] != direction]
+        if opposite:
+            return
+
+        # Pyramid check
+        same = [p for p in positions if p['type'] == direction]
+        is_pyramid = len(same) > 0
+        if is_pyramid and not self._should_pyramid(same, h1_bars, direction, probability):
+            return
+
+        # Execute
+        self._execute_trade(direction, probability, close, h1_bars,
+                            is_pyramid, len(same), news_scale)
+
+    def _execute_trade(self, direction, probability, price, h1_bars,
+                       is_pyramid, layer_count, news_scale):
+        """Build SL/TP and place order."""
+        atr = self._calculate_atr(h1_bars)
         if atr <= 0:
             return
 
-        current_price = float(completed_bar['close'])
-
         if direction == 'long':
-            sl = current_price - self.config.STOP_LOSS_ATR_MULT * atr
-            tp = current_price + self.config.TAKE_PROFIT_ATR_MULT * atr
+            sl = price - self.config.STOP_LOSS_ATR_MULT * atr
+            tp = price + self.config.TAKE_PROFIT_ATR_MULT * atr
         else:
-            sl = current_price + self.config.STOP_LOSS_ATR_MULT * atr
-            tp = current_price - self.config.TAKE_PROFIT_ATR_MULT * atr
+            sl = price + self.config.STOP_LOSS_ATR_MULT * atr
+            tp = price - self.config.TAKE_PROFIT_ATR_MULT * atr
 
         # Position sizing
         volume = VOLUME
@@ -416,227 +435,168 @@ class LiveTrader:
             kelly = self.predictor.kelly_size(probability, tp_sl)
             volume = max(round(VOLUME * max(kelly * 4, 0.5), 2), VOLUME)
 
-        # Apply news scaling
         volume = max(round(volume * news_scale, 2), VOLUME)
 
-        # Pyramid size decay
         if is_pyramid:
-            layer = len(same_direction_pos)
-            decay = self.config.PYRAMID_SIZE_DECAY ** layer
+            decay = self.config.PYRAMID_SIZE_DECAY ** layer_count
             volume = max(round(volume * decay, 2), VOLUME)
-            logger.info("  📐 PYRAMID layer %d (%.0f%% size)", layer + 1, decay * 100)
+            logger.info("  📐 PYRAMID layer %d (%.0f%%)", layer_count + 1, decay * 100)
 
-        logger.info("  → SL=%.2f TP=%.2f ATR=%.2f Vol=%.2f", sl, tp, atr, volume)
-
-        # ─── Execute ─────────────────────────────────────────────────────
         label = "PYRAMID" if is_pyramid else "NEW"
+        logger.info("  → %s %s: SL=%.2f TP=%.2f ATR=%.2f Vol=%.2f",
+                     label, direction.upper(), sl, tp, atr, volume)
+
         if self.dry_run:
-            logger.info("  🔸 DRY RUN: Would %s %s %.2f @ %.2f",
-                         label, direction.upper(), volume, current_price)
-            self._log_signal(direction, probability, current_price, sl, tp, volume, f"DRY_{label}")
+            logger.info("  🔸 DRY: Would %s %s %.2f @ %.2f",
+                         label, direction.upper(), volume, price)
+            self._log_signal(direction, probability, price, sl, tp, volume, f"DRY_{label}")
         else:
-            success = self.connector.place_order(direction, volume, sl, tp)
-            if success:
+            if self.connector.place_order(direction, volume, sl, tp):
                 self.trade_count += 1
-                self._log_signal(direction, probability, current_price, sl, tp, volume, label)
-            else:
-                self._log_signal(direction, probability, current_price, sl, tp, volume, "REJECTED")
+                self._log_signal(direction, probability, price, sl, tp, volume, label)
+
+    # ═══════════════════════════════════════════════════════════════════
+    # POSITION MANAGEMENT (M5-based, real-time)
+    # ═══════════════════════════════════════════════════════════════════
 
     def _get_all_positions(self) -> list:
-        """Get all open positions for our symbol."""
         try:
             positions = self.connector.mt5.positions_get(symbol=self.connector.symbol)
             if not positions:
                 return []
-            result = []
-            for pos in positions:
-                result.append({
-                    'ticket': pos.ticket,
-                    'type': 'long' if pos.type == 0 else 'short',
-                    'volume': pos.volume,
-                    'price_open': pos.price_open,
-                    'sl': pos.sl,
-                    'tp': pos.tp,
-                    'profit': pos.profit,
-                    'time': datetime.fromtimestamp(pos.time),
-                })
-            return result
+            return [{
+                'ticket': p.ticket,
+                'type': 'long' if p.type == 0 else 'short',
+                'volume': p.volume,
+                'price_open': p.price_open,
+                'sl': p.sl, 'tp': p.tp,
+                'profit': p.profit,
+                'time': datetime.fromtimestamp(p.time),
+            } for p in positions]
         except Exception:
             return []
 
-    def _manage_positions(self, positions: list, bars, mt5):
-        """
-        Smart position management — re-analyze every position like a human would.
-        
-        Each bar:
-        1. Time exit: >48h → close
-        2. Losing + ML flipped direction → early close (smart stop)
-        3. Losing but ML still agrees → hold (might recover)
-        4. Profitable → let SL/TP handle or trail
-        """
+    def _manage_positions(self, positions, h1_bars, m5_bars, now):
+        """Smart position management every 30 seconds."""
         if not positions:
             return
 
-        now = datetime.now()
         max_hold = timedelta(hours=self.config.MAX_BARS_IN_TRADE)
-        atr = self._calculate_atr(bars)
-        current_price = float(bars.iloc[-2]['close'])
+        atr = self._calculate_atr(h1_bars)
+        price = float(h1_bars.iloc[-1]['close'])
 
-        # Get current ML opinion
-        ml_direction, ml_prob = self._get_ml_signal(bars)
+        # M5 momentum
+        m5_mom = 0
+        if m5_bars is not None and len(m5_bars) > 3:
+            m5_mom = (float(m5_bars.iloc[-1]['close']) / float(m5_bars.iloc[-4]['close']) - 1) * 100
 
         for pos in positions:
-            hold_time = now - pos['time']
-            hold_hours = hold_time.total_seconds() / 3600
+            hold_h = (now - pos['time']).total_seconds() / 3600
+            pnl_pts = (price - pos['price_open']) if pos['type'] == 'long' \
+                else (pos['price_open'] - price)
+            pnl_atr = pnl_pts / atr if atr > 0 else 0
 
-            # Calculate unrealized P&L in ATR units
-            if pos['type'] == 'long':
-                unrealized_pts = current_price - pos['price_open']
-            else:
-                unrealized_pts = pos['price_open'] - current_price
-            unrealized_atr = unrealized_pts / atr if atr > 0 else 0
-
-            # ─── Rule 1: Time exit (hard limit) ─────────────────────────
-            if hold_time > max_hold:
-                logger.warning("  ⏰ TIME EXIT: ticket=%d held %.1fh, closing",
-                                pos['ticket'], hold_hours)
+            # Rule 1: Time exit (48h max)
+            if (now - pos['time']) > max_hold:
+                logger.warning("  ⏰ TIME EXIT: ticket=%d held %.1fh", pos['ticket'], hold_h)
                 self._close_position(pos)
                 continue
 
-            # ─── Rule 2: Smart re-analysis (losing positions) ────────────
-            if unrealized_atr < -0.5:  # Losing more than 0.5 ATR
-                if ml_direction is not None and ml_direction != pos['type']:
-                    # ML now says opposite direction → close early!
-                    logger.warning("  🔄 SMART EXIT: ticket=%d is %s but ML says %s (prob=%.2f). "
-                                    "Loss=%.1f ATR → closing early",
+            # Rule 2: ML says opposite + losing → smart exit
+            if pnl_atr < -0.5:
+                if self.h1_direction and self.h1_direction != pos['type']:
+                    logger.warning("  🔄 SMART EXIT: ticket=%d %s→ML=%s (loss=%.1f ATR)",
                                     pos['ticket'], pos['type'].upper(),
-                                    ml_direction.upper(), ml_prob,
-                                    unrealized_atr)
+                                    self.h1_direction.upper(), pnl_atr)
                     self._close_position(pos)
                     continue
-                elif ml_direction == pos['type']:
-                    # ML still agrees → hold, might recover
-                    logger.info("  🔁 HOLD: ticket=%d losing %.1f ATR but ML still says %s (prob=%.2f)",
-                                 pos['ticket'], abs(unrealized_atr),
-                                 pos['type'].upper(), ml_prob)
-                else:
-                    # ML has no signal → check if loss is too deep
-                    if unrealized_atr < -1.5:
-                        logger.warning("  📉 DEEP LOSS: ticket=%d at %.1f ATR loss, no ML signal → closing",
-                                        pos['ticket'], unrealized_atr)
-                        self._close_position(pos)
-                        continue
 
-            # ─── Rule 3: Profitable position logging ─────────────────────
-            elif unrealized_atr > 0.5:
-                logger.info("  💰 PROFIT: ticket=%d at +%.1f ATR ($%.2f)",
-                             pos['ticket'], unrealized_atr, pos['profit'])
+                # M5 momentum strongly against + significant loss
+                against = (pos['type'] == 'long' and m5_mom < -0.3) or \
+                          (pos['type'] == 'short' and m5_mom > 0.3)
+                if against and pnl_atr < -1.0:
+                    logger.warning("  📉 M5 EXIT: ticket=%d M5=%.2f%% loss=%.1f ATR",
+                                    pos['ticket'], m5_mom, pnl_atr)
+                    self._close_position(pos)
+                    continue
 
-    def _close_position(self, pos: dict):
-        """Close a position with dry-run support."""
+                # Deep loss with no signal
+                if pnl_atr < -1.5 and self.h1_direction is None:
+                    logger.warning("  📉 DEEP LOSS EXIT: ticket=%d loss=%.1f ATR",
+                                    pos['ticket'], pnl_atr)
+                    self._close_position(pos)
+                    continue
+
+    def _close_position(self, pos):
         if self.dry_run:
-            logger.info("  🔸 DRY RUN: Would close ticket=%d (%s, P&L=$%.2f)",
-                         pos['ticket'], pos['type'].upper(), pos['profit'])
+            logger.info("  🔸 DRY: Would close ticket=%d (P&L=$%.2f)", pos['ticket'], pos['profit'])
         else:
             self.connector.close_position(pos['ticket'])
 
-    def _should_pyramid(self, same_dir_positions: list, bars,
-                        direction: str, probability: float = 0) -> bool:
-        """
-        Smart pyramiding — based on ML confidence, not just profit.
-        
-        Pyramid if:
-        1. Not at max layers
-        2. ML gives strong signal in same direction (prob > threshold + 0.1)
-        3. At least one existing position is not deeply losing
-        """
+    def _should_pyramid(self, same_pos, bars, direction, probability=0):
         if not self.config.PYRAMIDING_ENABLED:
             return False
-
-        if len(same_dir_positions) > self.config.PYRAMID_MAX_LAYERS:
-            logger.info("  Max pyramid layers reached (%d)", len(same_dir_positions))
+        if len(same_pos) > self.config.PYRAMID_MAX_LAYERS:
             return False
 
-        # Check ML confidence is strong enough for pyramid
         import config
-        if direction == 'long':
-            threshold = getattr(config, 'ML_LONG_THRESHOLD', 0.22)
-        else:
-            threshold = getattr(config, 'ML_SHORT_THRESHOLD', 0.35)
+        threshold = getattr(config, 'ML_LONG_THRESHOLD', 0.22) if direction == 'long' \
+            else getattr(config, 'ML_SHORT_THRESHOLD', 0.35)
 
-        # Require higher confidence for pyramiding (threshold + 0.10)
-        pyramid_threshold = threshold + 0.10
-        if probability < pyramid_threshold:
-            logger.info("  Pyramid skip: prob=%.3f < pyramid threshold=%.3f",
-                         probability, pyramid_threshold)
+        if probability < threshold + 0.10:
+            logger.info("  Pyramid skip: prob=%.3f < %.3f", probability, threshold + 0.10)
             return False
 
-        # Check existing positions aren't deeply losing
         atr = self._calculate_atr(bars)
-        current_price = float(bars.iloc[-2]['close'])
-
-        for pos in same_dir_positions:
-            if pos['type'] == 'long':
-                unrealized = current_price - pos['price_open']
-            else:
-                unrealized = pos['price_open'] - current_price
-
-            # Don't pyramid if any position is deeply losing (> 1.5 ATR loss)
-            if unrealized < -1.5 * atr:
-                logger.info("  Pyramid skip: ticket=%d deeply losing (%.1f ATR)",
-                             pos['ticket'], unrealized / atr if atr > 0 else 0)
+        price = float(bars.iloc[-2]['close'])
+        for pos in same_pos:
+            u = (price - pos['price_open']) if pos['type'] == 'long' \
+                else (pos['price_open'] - price)
+            if u < -1.5 * atr:
                 return False
 
-        logger.info("  ✅ Pyramid: ML confident (%.3f > %.3f) + positions healthy",
-                     probability, pyramid_threshold)
+        logger.info("  ✅ Pyramid OK (prob=%.3f)", probability)
         return True
 
+    # ═══════════════════════════════════════════════════════════════════
+    # ML + FEATURE ENGINE
+    # ═══════════════════════════════════════════════════════════════════
+
     def _get_ml_signal(self, bars: pd.DataFrame) -> Tuple[Optional[str], float]:
-        """Compute ML features from bars and get prediction."""
         if not self.predictor:
             return None, 0.0
-
         try:
-            # Build features from live bars
             features = self._build_live_features(bars)
             if features is None or features.empty:
                 return None, 0.0
-
-            direction, prob = self.predictor.predict_direction(features)
-            return direction, prob
-
+            return self.predictor.predict_direction(features)
         except Exception as e:
             logger.warning("ML signal error: %s", e)
             return None, 0.0
 
     def _build_live_features(self, bars: pd.DataFrame) -> Optional[pd.DataFrame]:
-        """Build ML feature row from live H1 bars + multi-TF, strictly matching model features."""
+        """Build ML features from H1 bars + multi-TF."""
         try:
             import MetaTrader5 as mt5
             from ml.feature_engine import build_h1_features, add_higher_tf_features, add_m15_features
 
             df = bars.copy()
             df = build_h1_features(df)
-
             if df.empty:
                 return None
 
-            # Fetch higher timeframe bars from MT5
             h4_bars = self.connector.get_bars(mt5.TIMEFRAME_H4, 100)
             d1_bars = self.connector.get_bars(mt5.TIMEFRAME_D1, 100)
             m15_bars = self.connector.get_bars(mt5.TIMEFRAME_M15, 500)
 
-            # Add multi-TF features
             if h4_bars is not None or d1_bars is not None:
                 df = add_higher_tf_features(df, h4_df=h4_bars, d1_df=d1_bars)
             if m15_bars is not None:
                 df = add_m15_features(df, m15_bars)
 
-            # Take last row
             last_row = df.iloc[[-1]].copy()
             last_row = last_row.replace([np.inf, -np.inf], 0).fillna(0)
 
-            # Get the exact feature list from the saved model
             for direction in ['long', 'short']:
                 selected = self.predictor.models[direction].get('features', [])
                 if selected:
@@ -646,19 +606,18 @@ class LiveTrader:
                         if col in last_row.columns:
                             result[col] = last_row[col].values
                             matched += 1
-                    
                     logger.info("  Features: %d/%d matched", matched, len(selected))
                     return result
-
-            logger.warning("No saved feature list found in model")
             return None
-
         except Exception as e:
-            logger.warning("Feature build error: %s", e)
+            logger.warning("Feature error: %s", e)
             return None
 
-    def _calculate_atr(self, bars: pd.DataFrame, period: int = 14) -> float:
-        """Calculate current ATR from bars."""
+    # ═══════════════════════════════════════════════════════════════════
+    # HELPERS
+    # ═══════════════════════════════════════════════════════════════════
+
+    def _calculate_atr(self, bars, period=14):
         df = bars.tail(period + 1).copy()
         df['tr'] = np.maximum(
             df['high'] - df['low'],
@@ -669,8 +628,15 @@ class LiveTrader:
         )
         return float(df['tr'].dropna().mean())
 
+    def _calc_rsi(self, series, period=14):
+        delta = series.diff()
+        gain = delta.clip(lower=0).ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+        loss = (-delta).clip(lower=0).ewm(alpha=1/period, min_periods=period, adjust=False).mean()
+        rs = gain / loss
+        rsi = 100 - (100 / (1 + rs))
+        return float(rsi.iloc[-1]) if not rsi.empty else 50.0
+
     def _log_signal(self, direction, probability, price, sl, tp, volume, status):
-        """Log signal to CSV."""
         log_file = 'live_signals.csv'
         header = not os.path.exists(log_file)
         with open(log_file, 'a') as f:
@@ -683,22 +649,18 @@ class LiveTrader:
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="TradeBot MT5 Live Trader")
+    parser = argparse.ArgumentParser(description="TradeBot Multi-TF Live Trader v2.0")
     parser.add_argument('--dry-run', action='store_true',
                         help='Log signals without placing real orders')
-    parser.add_argument('--login', type=int, default=MT5_LOGIN,
-                        help='MT5 login number')
-    parser.add_argument('--password', type=str, default=MT5_PASSWORD,
-                        help='MT5 password')
-    parser.add_argument('--server', type=str, default=MT5_SERVER,
-                        help='MT5 server')
+    parser.add_argument('--login', type=int, default=MT5_LOGIN)
+    parser.add_argument('--password', type=str, default=MT5_PASSWORD)
+    parser.add_argument('--server', type=str, default=MT5_SERVER)
     args = parser.parse_args()
 
     print("═" * 60)
-    print("  TradeBot ML Live Trader v1.0")
+    print("  TradeBot Multi-TF Live Trader v2.0")
     print("═" * 60)
 
-    # Connect to MT5
     connector = MT5Connector(
         login=args.login or None,
         password=args.password or None,
@@ -706,7 +668,7 @@ def main():
     )
 
     if not connector.connect():
-        print("❌ Failed to connect to MT5. Make sure MT5 is running.")
+        print("❌ Failed to connect to MT5.")
         sys.exit(1)
 
     symbol = connector.find_symbol()
@@ -715,7 +677,6 @@ def main():
         connector.disconnect()
         sys.exit(1)
 
-    # Start trading
     trader = LiveTrader(connector, dry_run=args.dry_run)
     trader.run()
 
