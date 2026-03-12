@@ -131,3 +131,9 @@ TRADE_LOG_PATH = "trade_log.csv"
 LOG_LEVEL = logging.INFO
 LOG_FILE = "tradebot.log"
 LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+
+# === SECTION 8: TELEGRAM NOTIFICATIONS ===
+# 1. Telegram'da @BotFather'a /newbot yaz → token al
+# 2. @userinfobot'a yaz → chat_id al
+TELEGRAM_TOKEN = ""       # BotFather'dan aldığın token
+TELEGRAM_CHAT_ID = ""     # Senin chat ID'n

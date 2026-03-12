@@ -250,6 +250,14 @@ class LiveTrader:
         except Exception as e:
             logger.warning("Calendar unavailable: %s", e)
 
+        # Telegram notifications
+        self.telegram = None
+        try:
+            from telegram_bot import get_telegram
+            self.telegram = get_telegram()
+        except Exception as e:
+            logger.warning("Telegram unavailable: %s", e)
+
     def run(self):
         """Continuous multi-TF analysis every 30 seconds."""
         import MetaTrader5 as mt5
@@ -261,6 +269,13 @@ class LiveTrader:
         logger.info("  ML: %s", "Active" if self.predictor else "Disabled")
         logger.info("  Timeframes: H1 (strategy) + M15 (entry) + M5 (management)")
         logger.info("  Cycle: every 30 seconds")
+
+        if self.telegram:
+            self.telegram.notify_startup(
+                self.connector.symbol,
+                "DRY RUN" if self.dry_run else "LIVE",
+                bool(self.predictor)
+            )
 
         try:
             while True:
@@ -285,6 +300,13 @@ class LiveTrader:
         # Daily reset
         today = now.date()
         if self.current_day != today:
+            # Daily summary before reset
+            if self.current_day is not None and self.telegram:
+                account = self.mt5.account_info()
+                bal = account.balance if account else 0
+                self.telegram.notify_daily_summary(
+                    self.trade_count, 0, bal, self._get_all_positions()
+                )
             self.current_day = today
             self.trade_count = 0
             logger.info("═══ New day: %s ═══", today)
@@ -450,10 +472,17 @@ class LiveTrader:
             logger.info("  🔸 DRY: Would %s %s %.2f @ %.2f",
                          label, direction.upper(), volume, price)
             self._log_signal(direction, probability, price, sl, tp, volume, f"DRY_{label}")
+            if self.telegram:
+                self.telegram.notify_order(direction, volume, price, sl, tp, 0, f"DRY_{label}")
         else:
             if self.connector.place_order(direction, volume, sl, tp):
                 self.trade_count += 1
                 self._log_signal(direction, probability, price, sl, tp, volume, label)
+                if self.telegram:
+                    # Get last ticket
+                    positions = self._get_all_positions()
+                    ticket = positions[-1]['ticket'] if positions else 0
+                    self.telegram.notify_order(direction, volume, price, sl, tp, ticket, label)
 
     # ═══════════════════════════════════════════════════════════════════
     # POSITION MANAGEMENT (M5-based, real-time)
@@ -508,6 +537,9 @@ class LiveTrader:
                     logger.warning("  🔄 SMART EXIT: ticket=%d %s→ML=%s (loss=%.1f ATR)",
                                     pos['ticket'], pos['type'].upper(),
                                     self.h1_direction.upper(), pnl_atr)
+                    if self.telegram:
+                        self.telegram.notify_smart_exit(
+                            pos['ticket'], pos['type'], self.h1_direction, pnl_atr)
                     self._close_position(pos)
                     continue
 
