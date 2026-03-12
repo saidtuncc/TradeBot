@@ -127,8 +127,11 @@ class MLPredictor:
 
             meta = m.get('meta')
             if meta:
-                from ml.trainer import predict_stacking
-                final = predict_stacking(meta, np.array([lgb_prob]), np.array([lstm_prob]))[0]
+                try:
+                    from ml.trainer import predict_stacking
+                    final = predict_stacking(meta, np.array([lgb_prob]), np.array([lstm_prob]))[0]
+                except Exception:
+                    final = lgb_prob  # Fallback: raw LightGBM
             else:
                 final = lgb_prob
 

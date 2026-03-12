@@ -392,9 +392,10 @@ class LiveTrader:
             return None, 0.0
 
     def _build_live_features(self, bars: pd.DataFrame) -> Optional[pd.DataFrame]:
-        """Build ML feature row from live H1 bars, strictly matching model features."""
+        """Build ML feature row from live H1 bars + multi-TF, strictly matching model features."""
         try:
-            from ml.feature_engine import build_h1_features
+            import MetaTrader5 as mt5
+            from ml.feature_engine import build_h1_features, add_higher_tf_features, add_m15_features
 
             df = bars.copy()
             df = build_h1_features(df)
@@ -402,30 +403,35 @@ class LiveTrader:
             if df.empty:
                 return None
 
+            # Fetch higher timeframe bars from MT5
+            h4_bars = self.connector.get_bars(mt5.TIMEFRAME_H4, 100)
+            d1_bars = self.connector.get_bars(mt5.TIMEFRAME_D1, 100)
+            m15_bars = self.connector.get_bars(mt5.TIMEFRAME_M15, 500)
+
+            # Add multi-TF features
+            if h4_bars is not None or d1_bars is not None:
+                df = add_higher_tf_features(df, h4_df=h4_bars, d1_df=d1_bars)
+            if m15_bars is not None:
+                df = add_m15_features(df, m15_bars)
+
             # Take last row
             last_row = df.iloc[[-1]].copy()
             last_row = last_row.replace([np.inf, -np.inf], 0).fillna(0)
 
             # Get the exact feature list from the saved model
-            # Use 'long' features as primary (both models use same feature set)
             for direction in ['long', 'short']:
                 selected = self.predictor.models[direction].get('features', [])
                 if selected:
-                    # Build a row with EXACTLY the model's features
                     result = pd.DataFrame(0.0, index=last_row.index, columns=selected)
+                    matched = 0
                     for col in selected:
                         if col in last_row.columns:
                             result[col] = last_row[col].values
+                            matched += 1
                     
-                    missing = [c for c in selected if c not in last_row.columns]
-                    if missing:
-                        logger.debug("Missing features (filled with 0): %s", missing)
-                    
-                    logger.info("  Features: %d/%d matched", 
-                               len(selected) - len(missing), len(selected))
+                    logger.info("  Features: %d/%d matched", matched, len(selected))
                     return result
 
-            # No saved feature list — shouldn't happen
             logger.warning("No saved feature list found in model")
             return None
 
