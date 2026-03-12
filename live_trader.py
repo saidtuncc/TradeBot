@@ -295,16 +295,17 @@ class LiveTrader:
             logger.info("═══ Live Trader Stopped ═══")
 
     def _tick(self, mt5):
-        """Single tick: check for new bar, evaluate, trade."""
+        """Single tick: manage positions, check for new bar, evaluate, trade."""
         # Get latest bars
         bars = self.connector.get_bars(mt5.TIMEFRAME_H1, LOOKBACK_BARS)
         if bars is None or len(bars) < 50:
             return
 
-        latest_time = bars.iloc[-1]['datetime']
+        # ─── Position Management (every tick) ─────────────────────────────
+        positions = self._get_all_positions()
+        self._manage_positions(positions, bars, mt5)
 
-        # Only act on NEW completed bar (not the forming one)
-        # Use second-to-last bar as the completed one
+        # ─── New Bar Check ────────────────────────────────────────────────
         completed_bar = bars.iloc[-2]
         completed_time = completed_bar['datetime']
 
@@ -326,12 +327,26 @@ class LiveTrader:
                      completed_time, completed_bar['close'],
                      completed_bar['high'], completed_bar['low'])
 
-        # Check existing position
-        position = self.connector.get_position()
-        if position:
-            logger.info("  Open position: %s %.2f lots, P&L=$%.2f",
-                         position['type'].upper(), position['volume'], position['profit'])
-            return  # Don't open new while position exists
+        # Log open positions
+        if positions:
+            for pos in positions:
+                logger.info("  📌 %s %.2f lots, P&L=$%.2f (ticket=%d)",
+                             pos['type'].upper(), pos['volume'],
+                             pos['profit'], pos['ticket'])
+
+        # ─── Daily loss limit ────────────────────────────────────────────
+        account = mt5.account_info()
+        if account:
+            daily_limit = account.balance * self.config.MAX_DAILY_LOSS
+            if self.daily_pnl <= -daily_limit:
+                logger.warning("  ⛔ Daily loss limit reached ($%.2f)", self.daily_pnl)
+                return
+
+        # ─── Check if we can open more positions ─────────────────────────
+        max_pos = self.config.MAX_CONCURRENT_POSITIONS
+        if len(positions) >= max_pos:
+            logger.info("  Max positions reached (%d/%d)", len(positions), max_pos)
+            return
 
         # ─── ML Signal Generation ────────────────────────────────────────
         direction, probability = self._get_ml_signal(bars)
@@ -342,31 +357,47 @@ class LiveTrader:
 
         logger.info("  📊 ML SIGNAL: %s (prob=%.3f)", direction.upper(), probability)
 
-        # ─── Risk Checks ─────────────────────────────────────────────────
-        # News risk check
+        # ─── News Check ──────────────────────────────────────────────────
         news_scale = 1.0
         if self.news_mgr:
             score, events = self.news_mgr.calculate_risk_score()
             logger.info("  %s", self.news_mgr.get_status_line())
+
             if score >= 7.0:
-                logger.warning("  ⛔ NEWS BLOCKED: score=%.1f — skipping trade", score)
-                return
+                # HIGH risk: only block if event is UPCOMING (not past)
+                future_events = [e for e in events
+                                if (e.timestamp - now).total_seconds() > 0]
+                if future_events:
+                    logger.warning("  ⏳ NEWS WAIT: %s in %.1fh — waiting for post-event",
+                                    future_events[0].name,
+                                    (future_events[0].timestamp - now).total_seconds() / 3600)
+                    return
+                else:
+                    # Event just passed → volatility play! Trade with the move
+                    logger.info("  🔥 POST-NEWS: Event passed, trading momentum")
+                    news_scale = 1.0  # Full size on post-event momentum
             elif score >= 4.0:
                 news_scale = 0.5
-                logger.info("  ⚠️ NEWS REDUCED: score=%.1f — half volume", score)
+                logger.info("  ⚠️ NEWS NEARBY: score=%.1f — half volume", score)
 
-        # Daily loss limit check
-        account = mt5.account_info()
-        if account:
-            daily_limit = account.balance * self.config.MAX_DAILY_LOSS
-            if self.daily_pnl <= -daily_limit:
-                logger.warning("  ⛔ Daily loss limit reached ($%.2f)", self.daily_pnl)
+        # ─── Check if this is a pyramid or new trade ─────────────────────
+        same_direction_pos = [p for p in positions if p['type'] == direction]
+        opposite_pos = [p for p in positions if p['type'] != direction]
+
+        # Don't open opposite direction while positions exist
+        if opposite_pos:
+            logger.info("  Opposite position open — skipping %s signal", direction.upper())
+            return
+
+        # Pyramiding check
+        is_pyramid = len(same_direction_pos) > 0
+        if is_pyramid:
+            if not self._should_pyramid(same_direction_pos, bars, direction):
                 return
 
-        # ─── Calculate SL/TP/Size ─────────────────────────────────────────
+        # ─── Calculate SL/TP/Volume ──────────────────────────────────────
         atr = self._calculate_atr(bars)
         if atr <= 0:
-            logger.warning("  ATR=0, skipping")
             return
 
         current_price = float(completed_bar['close'])
@@ -378,8 +409,8 @@ class LiveTrader:
             sl = current_price + self.config.STOP_LOSS_ATR_MULT * atr
             tp = current_price - self.config.TAKE_PROFIT_ATR_MULT * atr
 
-        # Position sizing (Kelly-based)
-        volume = VOLUME  # Start with minimum
+        # Position sizing
+        volume = VOLUME
         if self.predictor and self.config.ML_CONFIDENCE_SIZING:
             tp_sl = self.config.TAKE_PROFIT_ATR_MULT / self.config.STOP_LOSS_ATR_MULT
             kelly = self.predictor.kelly_size(probability, tp_sl)
@@ -388,20 +419,99 @@ class LiveTrader:
         # Apply news scaling
         volume = max(round(volume * news_scale, 2), VOLUME)
 
+        # Pyramid size decay
+        if is_pyramid:
+            layer = len(same_direction_pos)
+            decay = self.config.PYRAMID_SIZE_DECAY ** layer
+            volume = max(round(volume * decay, 2), VOLUME)
+            logger.info("  📐 PYRAMID layer %d (%.0f%% size)", layer + 1, decay * 100)
+
         logger.info("  → SL=%.2f TP=%.2f ATR=%.2f Vol=%.2f", sl, tp, atr, volume)
 
         # ─── Execute ─────────────────────────────────────────────────────
+        label = "PYRAMID" if is_pyramid else "NEW"
         if self.dry_run:
-            logger.info("  🔸 DRY RUN: Would %s %.2f @ %.2f, SL=%.2f, TP=%.2f",
-                         direction.upper(), volume, current_price, sl, tp)
-            self._log_signal(direction, probability, current_price, sl, tp, volume, "DRY")
+            logger.info("  🔸 DRY RUN: Would %s %s %.2f @ %.2f",
+                         label, direction.upper(), volume, current_price)
+            self._log_signal(direction, probability, current_price, sl, tp, volume, f"DRY_{label}")
         else:
             success = self.connector.place_order(direction, volume, sl, tp)
             if success:
                 self.trade_count += 1
-                self._log_signal(direction, probability, current_price, sl, tp, volume, "FILLED")
+                self._log_signal(direction, probability, current_price, sl, tp, volume, label)
             else:
                 self._log_signal(direction, probability, current_price, sl, tp, volume, "REJECTED")
+
+    def _get_all_positions(self) -> list:
+        """Get all open positions for our symbol."""
+        try:
+            positions = self.connector.mt5.positions_get(symbol=self.connector.symbol)
+            if not positions:
+                return []
+            result = []
+            for pos in positions:
+                result.append({
+                    'ticket': pos.ticket,
+                    'type': 'long' if pos.type == 0 else 'short',
+                    'volume': pos.volume,
+                    'price_open': pos.price_open,
+                    'sl': pos.sl,
+                    'tp': pos.tp,
+                    'profit': pos.profit,
+                    'time': datetime.fromtimestamp(pos.time),
+                })
+            return result
+        except Exception:
+            return []
+
+    def _manage_positions(self, positions: list, bars, mt5):
+        """Check open positions for time-exit (max 48h hold)."""
+        if not positions:
+            return
+
+        now = datetime.now()
+        max_hold = timedelta(hours=self.config.MAX_BARS_IN_TRADE)  # 48 H1 bars = 48h
+
+        for pos in positions:
+            hold_time = now - pos['time']
+
+            # Time exit: close if held too long
+            if hold_time > max_hold:
+                logger.warning("  ⏰ TIME EXIT: ticket=%d held %.1fh (max=%dh), closing",
+                                pos['ticket'], hold_time.total_seconds() / 3600,
+                                self.config.MAX_BARS_IN_TRADE)
+                if not self.dry_run:
+                    self.connector.close_position(pos['ticket'])
+                else:
+                    logger.info("  🔸 DRY RUN: Would close ticket=%d (time exit)", pos['ticket'])
+
+    def _should_pyramid(self, same_dir_positions: list, bars, direction: str) -> bool:
+        """Check if we should add a pyramid layer."""
+        if not self.config.PYRAMIDING_ENABLED:
+            return False
+
+        if len(same_dir_positions) > self.config.PYRAMID_MAX_LAYERS:
+            logger.info("  Max pyramid layers reached (%d)", len(same_dir_positions))
+            return False
+
+        # Check if existing position is profitable enough
+        atr = self._calculate_atr(bars)
+        min_profit_points = self.config.PYRAMID_MIN_PROFIT_ATR * atr
+
+        for pos in same_dir_positions:
+            current_price = float(bars.iloc[-2]['close'])
+            if pos['type'] == 'long':
+                unrealized = current_price - pos['price_open']
+            else:
+                unrealized = pos['price_open'] - current_price
+
+            if unrealized < min_profit_points:
+                logger.info("  Pyramid skip: position not profitable enough (%.1f < %.1f ATR)",
+                             unrealized / atr if atr > 0 else 0, self.config.PYRAMID_MIN_PROFIT_ATR)
+                return False
+
+        logger.info("  ✅ Pyramid condition met: existing positions in profit")
+        return True
 
     def _get_ml_signal(self, bars: pd.DataFrame) -> Tuple[Optional[str], float]:
         """Compute ML features from bars and get prediction."""

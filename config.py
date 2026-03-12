@@ -34,10 +34,17 @@ EMA_SLOPE_MIN = 0.0005           # Min EMA slope (% change) to confirm trend
 # --- Exit Rules ---
 STOP_LOSS_ATR_MULT = 2.0         # ML-driven: tighter SL for controlled risk
 TAKE_PROFIT_ATR_MULT = 3.0       # Asymmetric 3:2 R:R → each win > each loss
-MAX_BARS_IN_TRADE = 10           # ML signals need room to develop
+MAX_BARS_IN_TRADE = 48           # Max 48 H1 bars = 2 days
 TRAILING_STOP_ENABLED = True
 BREAKEVEN_TRIGGER_ATR = 1.5      # Move SL to BE after 1.5×ATR profit
 TRAILING_STOP_ATR_MULT = 2.5     # Trail SL at 2.5×ATR behind price
+
+# --- Multi-Position ---
+MAX_CONCURRENT_POSITIONS = 3     # Max open positions at once
+PYRAMIDING_ENABLED = True        # Add to winning positions
+PYRAMID_MIN_PROFIT_ATR = 1.0     # Add layer when pos is +1 ATR in profit
+PYRAMID_MAX_LAYERS = 2           # Max additional layers per direction
+PYRAMID_SIZE_DECAY = 0.5         # Each layer = 50% of previous size
 
 # --- Risk Management ---
 RISK_PER_TRADE = 0.005
