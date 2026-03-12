@@ -392,7 +392,7 @@ class LiveTrader:
         # Pyramiding check
         is_pyramid = len(same_direction_pos) > 0
         if is_pyramid:
-            if not self._should_pyramid(same_direction_pos, bars, direction):
+            if not self._should_pyramid(same_direction_pos, bars, direction, probability):
                 return
 
         # ─── Calculate SL/TP/Volume ──────────────────────────────────────
@@ -465,28 +465,91 @@ class LiveTrader:
             return []
 
     def _manage_positions(self, positions: list, bars, mt5):
-        """Check open positions for time-exit (max 48h hold)."""
+        """
+        Smart position management — re-analyze every position like a human would.
+        
+        Each bar:
+        1. Time exit: >48h → close
+        2. Losing + ML flipped direction → early close (smart stop)
+        3. Losing but ML still agrees → hold (might recover)
+        4. Profitable → let SL/TP handle or trail
+        """
         if not positions:
             return
 
         now = datetime.now()
-        max_hold = timedelta(hours=self.config.MAX_BARS_IN_TRADE)  # 48 H1 bars = 48h
+        max_hold = timedelta(hours=self.config.MAX_BARS_IN_TRADE)
+        atr = self._calculate_atr(bars)
+        current_price = float(bars.iloc[-2]['close'])
+
+        # Get current ML opinion
+        ml_direction, ml_prob = self._get_ml_signal(bars)
 
         for pos in positions:
             hold_time = now - pos['time']
+            hold_hours = hold_time.total_seconds() / 3600
 
-            # Time exit: close if held too long
+            # Calculate unrealized P&L in ATR units
+            if pos['type'] == 'long':
+                unrealized_pts = current_price - pos['price_open']
+            else:
+                unrealized_pts = pos['price_open'] - current_price
+            unrealized_atr = unrealized_pts / atr if atr > 0 else 0
+
+            # ─── Rule 1: Time exit (hard limit) ─────────────────────────
             if hold_time > max_hold:
-                logger.warning("  ⏰ TIME EXIT: ticket=%d held %.1fh (max=%dh), closing",
-                                pos['ticket'], hold_time.total_seconds() / 3600,
-                                self.config.MAX_BARS_IN_TRADE)
-                if not self.dry_run:
-                    self.connector.close_position(pos['ticket'])
-                else:
-                    logger.info("  🔸 DRY RUN: Would close ticket=%d (time exit)", pos['ticket'])
+                logger.warning("  ⏰ TIME EXIT: ticket=%d held %.1fh, closing",
+                                pos['ticket'], hold_hours)
+                self._close_position(pos)
+                continue
 
-    def _should_pyramid(self, same_dir_positions: list, bars, direction: str) -> bool:
-        """Check if we should add a pyramid layer."""
+            # ─── Rule 2: Smart re-analysis (losing positions) ────────────
+            if unrealized_atr < -0.5:  # Losing more than 0.5 ATR
+                if ml_direction is not None and ml_direction != pos['type']:
+                    # ML now says opposite direction → close early!
+                    logger.warning("  🔄 SMART EXIT: ticket=%d is %s but ML says %s (prob=%.2f). "
+                                    "Loss=%.1f ATR → closing early",
+                                    pos['ticket'], pos['type'].upper(),
+                                    ml_direction.upper(), ml_prob,
+                                    unrealized_atr)
+                    self._close_position(pos)
+                    continue
+                elif ml_direction == pos['type']:
+                    # ML still agrees → hold, might recover
+                    logger.info("  🔁 HOLD: ticket=%d losing %.1f ATR but ML still says %s (prob=%.2f)",
+                                 pos['ticket'], abs(unrealized_atr),
+                                 pos['type'].upper(), ml_prob)
+                else:
+                    # ML has no signal → check if loss is too deep
+                    if unrealized_atr < -1.5:
+                        logger.warning("  📉 DEEP LOSS: ticket=%d at %.1f ATR loss, no ML signal → closing",
+                                        pos['ticket'], unrealized_atr)
+                        self._close_position(pos)
+                        continue
+
+            # ─── Rule 3: Profitable position logging ─────────────────────
+            elif unrealized_atr > 0.5:
+                logger.info("  💰 PROFIT: ticket=%d at +%.1f ATR ($%.2f)",
+                             pos['ticket'], unrealized_atr, pos['profit'])
+
+    def _close_position(self, pos: dict):
+        """Close a position with dry-run support."""
+        if self.dry_run:
+            logger.info("  🔸 DRY RUN: Would close ticket=%d (%s, P&L=$%.2f)",
+                         pos['ticket'], pos['type'].upper(), pos['profit'])
+        else:
+            self.connector.close_position(pos['ticket'])
+
+    def _should_pyramid(self, same_dir_positions: list, bars,
+                        direction: str, probability: float = 0) -> bool:
+        """
+        Smart pyramiding — based on ML confidence, not just profit.
+        
+        Pyramid if:
+        1. Not at max layers
+        2. ML gives strong signal in same direction (prob > threshold + 0.1)
+        3. At least one existing position is not deeply losing
+        """
         if not self.config.PYRAMIDING_ENABLED:
             return False
 
@@ -494,23 +557,38 @@ class LiveTrader:
             logger.info("  Max pyramid layers reached (%d)", len(same_dir_positions))
             return False
 
-        # Check if existing position is profitable enough
+        # Check ML confidence is strong enough for pyramid
+        import config
+        if direction == 'long':
+            threshold = getattr(config, 'ML_LONG_THRESHOLD', 0.22)
+        else:
+            threshold = getattr(config, 'ML_SHORT_THRESHOLD', 0.35)
+
+        # Require higher confidence for pyramiding (threshold + 0.10)
+        pyramid_threshold = threshold + 0.10
+        if probability < pyramid_threshold:
+            logger.info("  Pyramid skip: prob=%.3f < pyramid threshold=%.3f",
+                         probability, pyramid_threshold)
+            return False
+
+        # Check existing positions aren't deeply losing
         atr = self._calculate_atr(bars)
-        min_profit_points = self.config.PYRAMID_MIN_PROFIT_ATR * atr
+        current_price = float(bars.iloc[-2]['close'])
 
         for pos in same_dir_positions:
-            current_price = float(bars.iloc[-2]['close'])
             if pos['type'] == 'long':
                 unrealized = current_price - pos['price_open']
             else:
                 unrealized = pos['price_open'] - current_price
 
-            if unrealized < min_profit_points:
-                logger.info("  Pyramid skip: position not profitable enough (%.1f < %.1f ATR)",
-                             unrealized / atr if atr > 0 else 0, self.config.PYRAMID_MIN_PROFIT_ATR)
+            # Don't pyramid if any position is deeply losing (> 1.5 ATR loss)
+            if unrealized < -1.5 * atr:
+                logger.info("  Pyramid skip: ticket=%d deeply losing (%.1f ATR)",
+                             pos['ticket'], unrealized / atr if atr > 0 else 0)
                 return False
 
-        logger.info("  ✅ Pyramid condition met: existing positions in profit")
+        logger.info("  ✅ Pyramid: ML confident (%.3f > %.3f) + positions healthy",
+                     probability, pyramid_threshold)
         return True
 
     def _get_ml_signal(self, bars: pd.DataFrame) -> Tuple[Optional[str], float]:
