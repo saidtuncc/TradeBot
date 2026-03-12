@@ -135,5 +135,5 @@ LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 # === SECTION 8: TELEGRAM NOTIFICATIONS ===
 # 1. Telegram'da @BotFather'a /newbot yaz → token al
 # 2. @userinfobot'a yaz → chat_id al
-TELEGRAM_TOKEN = ""       # BotFather'dan aldığın token
-TELEGRAM_CHAT_ID = ""     # Senin chat ID'n
+TELEGRAM_TOKEN = "8699911093:AAF1sq9Ea7EiAPQdzeKQ62_pTiUyxAWdjXg"
+TELEGRAM_CHAT_ID = "1338078318"
