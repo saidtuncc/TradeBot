@@ -178,18 +178,14 @@ class LiveNewsManager:
 
             url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
-            # SSL context — try verified first, fallback to unverified
+            # SSL — bypass verification directly (VPS lacks root certs)
             try:
-                ctx = ssl.create_default_context()
-                req = urllib.request.Request(url, headers={'User-Agent': 'TradeBot/2.0'})
-                with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-                    data = json.loads(resp.read().decode())
-            except ssl.SSLError:
-                # VPS might lack root certificates — bypass SSL verification
                 ctx = ssl._create_unverified_context()
-                req = urllib.request.Request(url, headers={'User-Agent': 'TradeBot/2.0'})
-                with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
-                    data = json.loads(resp.read().decode())
+            except Exception:
+                ctx = None
+            req = urllib.request.Request(url, headers={'User-Agent': 'TradeBot/2.0'})
+            with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                data = json.loads(resp.read().decode())
 
             now = datetime.utcnow()
 
