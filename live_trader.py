@@ -42,7 +42,7 @@ MT5_PATH = None         # Path to MT5 terminal.exe (auto-detect if None)
 # Trading
 SYMBOL = "USATECHIDXUSD"   # MT5 symbol name (check your broker's name)
 TIMEFRAME_H1 = None         # Set after MT5 import
-VOLUME = 0.01               # Minimum lot size for demo
+VOLUME = 0.10               # Minimum lot for NASDAQ CFD
 CHECK_INTERVAL_SEC = 60     # Check every 60 seconds
 LOOKBACK_BARS = 200         # Bars to fetch for feature calculation
 
