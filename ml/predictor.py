@@ -35,13 +35,22 @@ class MLPredictor:
                 if os.path.exists(lgb_path):
                     self.models[direction]['lgb'] = lgb.Booster(model_file=lgb_path)
 
+            except Exception as e:
+                logger.warning("Failed to load %s LightGBM: %s", direction, e)
+
+            # LSTM: separate try/except — TF may not be installed (VPS)
+            try:
                 keras_path = os.path.join(self.models_dir, f'lstm_{direction}.keras')
                 if os.path.exists(keras_path):
                     os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'
                     import tensorflow as tf
                     tf.get_logger().setLevel('ERROR')
                     self.models[direction]['lstm'] = tf.keras.models.load_model(keras_path)
+            except Exception:
+                pass  # LSTM optional — LightGBM is enough
 
+            # PKL artifacts (meta model, thresholds, scalers)
+            try:
                 for key in ['lstm_scaler', 'lstm_features', 'meta', 'threshold', 'features']:
                     path = os.path.join(self.models_dir, f'{key}_{direction}.pkl')
                     if os.path.exists(path):
@@ -55,7 +64,7 @@ class MLPredictor:
                         self.models[direction]['features'] = json.load(f)
 
             except Exception as e:
-                logger.warning("Failed to load %s models: %s", direction, e)
+                logger.warning("Failed to load %s artifacts: %s", direction, e)
 
         self.loaded = bool(self.models['long'].get('lgb'))
         if self.loaded:
