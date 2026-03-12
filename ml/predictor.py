@@ -28,7 +28,10 @@ class MLPredictor:
         for direction in ['long', 'short']:
             try:
                 import lightgbm as lgb
-                lgb_path = os.path.join(self.models_dir, f'lgb_{direction}.txt')
+                # Prefer binary (.bin) over text (.txt) — binary survives Git
+                bin_path = os.path.join(self.models_dir, f'lgb_{direction}.bin')
+                txt_path = os.path.join(self.models_dir, f'lgb_{direction}.txt')
+                lgb_path = bin_path if os.path.exists(bin_path) else txt_path
                 if os.path.exists(lgb_path):
                     self.models[direction]['lgb'] = lgb.Booster(model_file=lgb_path)
 

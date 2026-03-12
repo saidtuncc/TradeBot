@@ -1,0 +1,6 @@
+# Prevent Git from modifying binary/model files
+*.bin binary
+*.pkl binary
+*.keras binary
+*.h5 binary
+*.txt -diff
