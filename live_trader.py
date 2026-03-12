@@ -392,7 +392,7 @@ class LiveTrader:
             return None, 0.0
 
     def _build_live_features(self, bars: pd.DataFrame) -> Optional[pd.DataFrame]:
-        """Build ML feature row from live H1 bars."""
+        """Build ML feature row from live H1 bars, strictly matching model features."""
         try:
             from ml.feature_engine import build_h1_features
 
@@ -402,21 +402,32 @@ class LiveTrader:
             if df.empty:
                 return None
 
-            # Take last row as feature vector
-            last_row = df.iloc[[-1]]
+            # Take last row
+            last_row = df.iloc[[-1]].copy()
+            last_row = last_row.replace([np.inf, -np.inf], 0).fillna(0)
 
-            # Select only model features
+            # Get the exact feature list from the saved model
+            # Use 'long' features as primary (both models use same feature set)
             for direction in ['long', 'short']:
                 selected = self.predictor.models[direction].get('features', [])
                 if selected:
-                    available = [c for c in selected if c in last_row.columns]
-                    if len(available) >= len(selected) * 0.7:
-                        # Good enough feature coverage
-                        return last_row[available].replace([np.inf, -np.inf], 0).fillna(0)
+                    # Build a row with EXACTLY the model's features
+                    result = pd.DataFrame(0.0, index=last_row.index, columns=selected)
+                    for col in selected:
+                        if col in last_row.columns:
+                            result[col] = last_row[col].values
+                    
+                    missing = [c for c in selected if c not in last_row.columns]
+                    if missing:
+                        logger.debug("Missing features (filled with 0): %s", missing)
+                    
+                    logger.info("  Features: %d/%d matched", 
+                               len(selected) - len(missing), len(selected))
+                    return result
 
-            # Fallback: use all available
-            return last_row.select_dtypes(include=[np.number]).replace(
-                [np.inf, -np.inf], 0).fillna(0)
+            # No saved feature list — shouldn't happen
+            logger.warning("No saved feature list found in model")
+            return None
 
         except Exception as e:
             logger.warning("Feature build error: %s", e)
