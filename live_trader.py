@@ -48,8 +48,9 @@ LOOKBACK_BARS = 200         # Bars to fetch for feature calculation
 
 # Mapping of config -> MT5 symbol alternatives
 SYMBOL_ALTERNATIVES = [
-    "USATECHIDXUSD", "USTEC", "NAS100", "NASDAQ", "US100",
-    "USATECHIDXUSD.", "USTEC.", "#NAS100", "NAS100.cash"
+    "US100Cash", "US100", "USATECHIDXUSD", "USTEC", "NAS100",
+    "NASDAQ", "Nasdaq", "US100.cash", "#NAS100", "NAS100.cash",
+    "GerTech30Cash", "US100-MAR26",
 ]
 
 
