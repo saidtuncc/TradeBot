@@ -154,7 +154,12 @@ class MT5Connector:
         price = round(price, digits)
         sl = round(sl, digits)
         tp = round(tp, digits)
-        volume = round(volume, 2)  # Lots to 2 decimals
+        
+        # Enforce broker's volume constraints
+        vol_min = symbol_info.volume_min
+        vol_step = symbol_info.volume_step
+        volume = max(volume, vol_min)
+        volume = round(round(volume / vol_step) * vol_step, 5)
 
         request = {
             "action": self.mt5.TRADE_ACTION_DEAL,
