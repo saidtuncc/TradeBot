@@ -153,51 +153,67 @@ class LiveNewsManager:
         return events
 
     def _fetch_from_web(self) -> List[LiveEvent]:
-        """Fallback: fetch from ForexFactory or similar (scraping)."""
+        """Fetch from ForexFactory calendar (faireconomy.media JSON API)."""
         events = []
         try:
             import urllib.request
+            import ssl
             import json
 
-            # Use a free economic calendar API
-            today = datetime.utcnow().strftime('%Y-%m-%d')
-            url = f"https://nfs.faireconomy.media/ff_calendar_thisweek.json"
+            url = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
-            req = urllib.request.Request(url, headers={
-                'User-Agent': 'TradeBot/1.0'
-            })
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.loads(resp.read().decode())
+            # SSL context — try verified first, fallback to unverified
+            try:
+                ctx = ssl.create_default_context()
+                req = urllib.request.Request(url, headers={'User-Agent': 'TradeBot/2.0'})
+                with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                    data = json.loads(resp.read().decode())
+            except ssl.SSLError:
+                # VPS might lack root certificates — bypass SSL verification
+                ctx = ssl._create_unverified_context()
+                req = urllib.request.Request(url, headers={'User-Agent': 'TradeBot/2.0'})
+                with urllib.request.urlopen(req, timeout=15, context=ctx) as resp:
+                    data = json.loads(resp.read().decode())
 
             now = datetime.utcnow()
 
             for item in data:
                 country = item.get('country', '')
                 if country != 'USD':
-                    continue  # Only US events
-
-                title = item.get('title', '')
-                impact_str = item.get('impact', '').upper()
-
-                # Parse date
-                date_str = item.get('date', '')
-                try:
-                    event_time = datetime.strptime(date_str, '%Y-%m-%dT%H:%M:%S%z')
-                    event_time = event_time.replace(tzinfo=None)  # Remove tz for comparison
-                except ValueError:
                     continue
 
-                # Only future events
+                title = item.get('title', '')
+                impact_raw = item.get('impact', '').strip()
+                date_str = item.get('date', '')
+
+                # Parse date — ForexFactory uses various formats
+                event_time = None
+                for fmt in ['%Y-%m-%dT%H:%M:%S%z',
+                            '%Y-%m-%dT%H:%M:%S',
+                            '%b %d, %Y %I:%M%p']:
+                    try:
+                        event_time = datetime.strptime(date_str.strip(), fmt)
+                        if event_time.tzinfo:
+                            event_time = event_time.replace(tzinfo=None)
+                        break
+                    except ValueError:
+                        continue
+
+                if event_time is None:
+                    continue
+
+                # Skip old events (>1h ago)
                 if event_time < now - timedelta(hours=1):
                     continue
 
-                # Map impact
-                if impact_str in ('HIGH', 'HOLIDAY'):
+                # ForexFactory impact: "High", "Medium", "Low", "Holiday"
+                impact_upper = impact_raw.upper() if impact_raw else ''
+                if impact_upper in ('HIGH', 'HOLIDAY') or 'High' in impact_raw:
                     impact = 'HIGH'
-                elif impact_str == 'MEDIUM':
+                elif impact_upper == 'MEDIUM' or 'Medium' in impact_raw:
                     impact = 'MEDIUM'
                 else:
-                    # Also check by keyword
+                    # Use keyword classification as fallback
                     impact = self._classify_impact(title)
                     if impact == 'LOW':
                         continue
@@ -207,12 +223,14 @@ class LiveNewsManager:
                     name=title,
                     country='US',
                     impact=impact,
+                    actual=item.get('actual', ''),
                     forecast=item.get('forecast', ''),
                     previous=item.get('previous', ''),
                 ))
 
             events.sort(key=lambda e: e.timestamp)
-            logger.info("Fetched %d USD events from web calendar", len(events))
+            if events:
+                logger.info("📅 Fetched %d USD events from ForexFactory", len(events))
 
         except Exception as e:
             logger.warning("Web calendar fetch failed: %s", e)
