@@ -257,6 +257,16 @@ class LiveTrader:
         import config
         self.config = config
 
+        # Load live news calendar
+        self.news_mgr = None
+        try:
+            from live_news import get_live_news
+            self.news_mgr = get_live_news()
+            self.news_mgr.refresh_events(force=True)
+            logger.info("Live Calendar: ✅")
+        except Exception as e:
+            logger.warning("Live Calendar not available: %s", e)
+
     def run(self):
         """Main loop: check every minute, trade on new H1 bar."""
         import MetaTrader5 as mt5
@@ -333,6 +343,18 @@ class LiveTrader:
         logger.info("  📊 ML SIGNAL: %s (prob=%.3f)", direction.upper(), probability)
 
         # ─── Risk Checks ─────────────────────────────────────────────────
+        # News risk check
+        news_scale = 1.0
+        if self.news_mgr:
+            score, events = self.news_mgr.calculate_risk_score()
+            logger.info("  %s", self.news_mgr.get_status_line())
+            if score >= 7.0:
+                logger.warning("  ⛔ NEWS BLOCKED: score=%.1f — skipping trade", score)
+                return
+            elif score >= 4.0:
+                news_scale = 0.5
+                logger.info("  ⚠️ NEWS REDUCED: score=%.1f — half volume", score)
+
         # Daily loss limit check
         account = mt5.account_info()
         if account:
@@ -362,6 +384,9 @@ class LiveTrader:
             tp_sl = self.config.TAKE_PROFIT_ATR_MULT / self.config.STOP_LOSS_ATR_MULT
             kelly = self.predictor.kelly_size(probability, tp_sl)
             volume = max(round(VOLUME * max(kelly * 4, 0.5), 2), VOLUME)
+
+        # Apply news scaling
+        volume = max(round(volume * news_scale, 2), VOLUME)
 
         logger.info("  → SL=%.2f TP=%.2f ATR=%.2f Vol=%.2f", sl, tp, atr, volume)
 
