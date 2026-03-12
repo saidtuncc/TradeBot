@@ -47,6 +47,13 @@ class MLPredictor:
                     if os.path.exists(path):
                         self.models[direction][key] = joblib.load(path)
 
+                # Features: prefer JSON (Git-safe) over pkl
+                json_path = os.path.join(self.models_dir, f'features_{direction}.json')
+                if os.path.exists(json_path):
+                    import json
+                    with open(json_path) as f:
+                        self.models[direction]['features'] = json.load(f)
+
             except Exception as e:
                 logger.warning("Failed to load %s models: %s", direction, e)
 
