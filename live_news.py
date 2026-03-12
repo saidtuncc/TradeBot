@@ -11,29 +11,45 @@ from dataclasses import dataclass
 
 logger = logging.getLogger('live_news')
 
-# NASDAQ-critical US economic events (keywords to match)
-HIGH_IMPACT_KEYWORDS = [
+# ═══════════════════════════════════════════════════════════════════
+# NASDAQ-SPECIFIC IMPACT CLASSIFICATION
+# Not all USD events affect NASDAQ equally. Fed/CPI/GDP are huge,
+# but Building Permits or Trade Balance barely move tech stocks.
+# ═══════════════════════════════════════════════════════════════════
+
+# DEV impact → score multiplier 3.0 (tradı tamamen durdur)
+NASDAQ_DEV_KEYWORDS = [
+    'federal funds rate', 'interest rate decision', 'fomc',
+    'fed chair', 'powell speaks', 'powell press',
     'nonfarm', 'non-farm', 'nfp', 'payroll',
-    'fomc', 'federal funds rate', 'interest rate decision',
-    'cpi', 'consumer price index', 'inflation',
-    'gdp', 'gross domestic product',
-    'pce', 'core pce',
-    'unemployment', 'jobless claims',
-    'retail sales',
-    'ppi', 'producer price',
-    'ism manufacturing', 'ism services',
-    'fed chair', 'powell',
+    'cpi', 'consumer price index', 'core cpi',
+    'core pce', 'pce price index',
 ]
 
-MEDIUM_IMPACT_KEYWORDS = [
-    'durable goods', 'housing starts', 'building permits',
-    'consumer confidence', 'michigan sentiment',
-    'trade balance', 'industrial production',
-    'existing home', 'new home sales',
-    'jolts', 'adp employment',
-    'treasury', 'bond auction',
-    'crude oil inventories', 'eia',
+# HIGH impact → score multiplier 2.0 (bekle, sonra momentum trade)
+NASDAQ_HIGH_KEYWORDS = [
+    'gdp', 'gross domestic product',
+    'retail sales',
+    'ppi', 'producer price',
+    'unemployment', 'jobless claims', 'initial claims',
+    'ism manufacturing', 'ism services', 'ism non-manufacturing',
+    'michigan sentiment', 'consumer sentiment',
+    'jolts', 'job openings',
 ]
+
+# MEDIUM impact → score multiplier 1.0 (volume küçült)
+NASDAQ_MEDIUM_KEYWORDS = [
+    'adp employment', 'adp nonfarm',
+    'consumer confidence',
+    'industrial production',
+    'existing home sales', 'new home sales',
+    'crude oil inventories', 'eia',
+    'philly fed', 'empire state',
+]
+
+# IGNORED — these barely affect NASDAQ:
+# building permits, housing starts, trade balance,
+# durable goods (core), treasury auctions, bond auctions
 
 
 @dataclass
@@ -206,17 +222,10 @@ class LiveNewsManager:
                 if event_time < now - timedelta(hours=1):
                     continue
 
-                # ForexFactory impact: "High", "Medium", "Low", "Holiday"
-                impact_upper = impact_raw.upper() if impact_raw else ''
-                if impact_upper in ('HIGH', 'HOLIDAY') or 'High' in impact_raw:
-                    impact = 'HIGH'
-                elif impact_upper == 'MEDIUM' or 'Medium' in impact_raw:
-                    impact = 'MEDIUM'
-                else:
-                    # Use keyword classification as fallback
-                    impact = self._classify_impact(title)
-                    if impact == 'LOW':
-                        continue
+                # Use NASDAQ-specific classification (not FF generic impact)
+                impact = self._classify_impact(title)
+                if impact == 'LOW':
+                    continue
 
                 events.append(LiveEvent(
                     timestamp=event_time,
@@ -238,14 +247,18 @@ class LiveNewsManager:
         return events
 
     def _classify_impact(self, event_name: str) -> str:
-        """Classify event impact by keyword matching."""
+        """Classify event impact on NASDAQ specifically."""
         name_lower = event_name.lower()
 
-        for keyword in HIGH_IMPACT_KEYWORDS:
+        for keyword in NASDAQ_DEV_KEYWORDS:
+            if keyword in name_lower:
+                return 'DEV'
+
+        for keyword in NASDAQ_HIGH_KEYWORDS:
             if keyword in name_lower:
                 return 'HIGH'
 
-        for keyword in MEDIUM_IMPACT_KEYWORDS:
+        for keyword in NASDAQ_MEDIUM_KEYWORDS:
             if keyword in name_lower:
                 return 'MEDIUM'
 
@@ -253,18 +266,16 @@ class LiveNewsManager:
 
     def calculate_risk_score(self, current_time: datetime = None) -> Tuple[float, List[LiveEvent]]:
         """
-        Calculate risk score based on upcoming events.
-        Returns (score, list_of_upcoming_events).
+        NASDAQ-specific risk score.
 
-        Score thresholds (same as backtest):
-          < 4.0 → Normal (full size)
-          4.0-6.9 → Reduced (half size)
-          ≥ 7.0 → Blocked (no entry)
+        Score thresholds:
+          < 3.0 → Normal trading
+          3.0-5.9 → Reduced volume (half)
+          ≥ 6.0 → Wait for post-event momentum
         """
         if current_time is None:
             current_time = datetime.now()
 
-        # Auto-refresh if needed
         self.refresh_events()
 
         upcoming = []
@@ -274,20 +285,25 @@ class LiveNewsManager:
             hours_until = (event.timestamp - current_time).total_seconds() / 3600
 
             if hours_until < -1 or hours_until > 4:
-                continue  # Only events in [-1h, +4h] window
+                continue
 
             upcoming.append(event)
 
             # Time decay
             if hours_until < 1.0:
-                time_mult = 3.0  # Immediate
+                time_mult = 3.0
             elif hours_until < 2.0:
-                time_mult = 2.0  # Near
+                time_mult = 2.0
             else:
-                time_mult = 1.0  # Far
+                time_mult = 1.0
 
-            # Impact weight
-            impact_mult = 2.0 if event.impact == 'HIGH' else 1.0
+            # NASDAQ impact weight
+            if event.impact == 'DEV':
+                impact_mult = 3.0
+            elif event.impact == 'HIGH':
+                impact_mult = 2.0
+            else:
+                impact_mult = 1.0
 
             total_score += time_mult * impact_mult
 
@@ -301,9 +317,9 @@ class LiveNewsManager:
 
         next_event = events[0]
         hours = (next_event.timestamp - datetime.now()).total_seconds() / 3600
-        risk = "🔴 BLOCKED" if score >= 7.0 else "🟡 REDUCED" if score >= 4.0 else "🟢 NORMAL"
+        risk = "🔴 WAIT" if score >= 6.0 else "🟡 REDUCED" if score >= 3.0 else "🟢 CLEAR"
 
-        return f"📅 {risk} (score={score:.1f}) | Next: {next_event.name} in {hours:.1f}h"
+        return f"📅 {risk} (score={score:.1f}) | Next: {next_event.name} [{next_event.impact}] in {hours:.1f}h"
 
 
 # Singleton

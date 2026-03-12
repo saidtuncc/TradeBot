@@ -363,7 +363,7 @@ class LiveTrader:
         news_scale = 1.0
         if self.news_mgr:
             score, events = self.news_mgr.calculate_risk_score()
-            if score >= 7.0:
+            if score >= 6.0:
                 future = [e for e in events if (e.timestamp - now).total_seconds() > 0]
                 if future:
                     logger.info("  ⏳ News wait: %s in %.1fh",
@@ -372,7 +372,7 @@ class LiveTrader:
                     return
                 else:
                     logger.info("  🔥 Post-news momentum")
-            elif score >= 4.0:
+            elif score >= 3.0:
                 news_scale = 0.5
 
         # Need H1 direction
