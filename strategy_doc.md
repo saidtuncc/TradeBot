@@ -1,97 +1,55 @@
-# strategy_doc.md
-# NASDAQ H1 Trend-Following Trading System
+# TradeBot — ML-Enhanced NASDAQ Trading System v1.0
 
 ## Overview
-
-A robust, rule-based, low-risk trend-following system designed for the NASDAQ index on the H1 timeframe. Prioritizes clarity and simplicity over complexity to avoid overfitting.
-
----
-
-## Strategy Logic (Plain English)
-
-**Core Philosophy:** Trade with the established trend, protect capital aggressively, and avoid uncertain conditions.
-
-The system waits for a clear trend to establish (price above/below EMA 50), confirms momentum is present but not exhausted (RSI filter), ensures the market is active enough to trade (ATR volatility filter), and avoids high-impact news events.
-
-### Indicators Used (3 Total)
-
-| # | Category | Indicator | Purpose |
-|---|----------|-----------|---------|
-| 1 | Trend | EMA 50 | Direction filter - only trade in trend direction |
-| 2 | Volatility | ATR 14 | Dynamic stop sizing + chop filter |
-| 3 | Momentum | RSI 14 | Prevents exhaustion entries |
+ML-driven NASDAQ H1 trend-following system with dual LONG/SHORT LightGBM models, 
+Kelly criterion position sizing, news risk scoring, and drawdown control.
 
 ---
 
-## Entry Conditions
+## Architecture
 
-### Long Entry (ALL must be true)
-1. ✅ Close > EMA(50)
-2. ✅ 40 ≤ RSI(14) ≤ 70
-3. ✅ ATR(14) > 0.5 × ATR_Average(50)
-4. ✅ Not in news blackout window
-5. ✅ Daily loss < 1%
+```
+ML Models (Offense)     →  Signal + Probability
+Backend Rules (Defense) →  Guardrails + Risk Management
+```
 
-### Short Entry (ALL must be true)
-1. ✅ Close < EMA(50)
-2. ✅ 30 ≤ RSI(14) ≤ 60
-3. ✅ ATR(14) > 0.5 × ATR_Average(50)
-4. ✅ Not in news blackout window
-5. ✅ Daily loss < 1%
+### ML Layer
+- **Dual Models:** Separate LONG/SHORT LightGBM + LSTM stacking
+- **Features:** 33 selected from 50+ (multi-TF: H1, M15, H4, D1)
+- **Sizing:** Kelly criterion (quarter-Kelly, confidence-based)
+- **Retrain:** Rolling 3-year window, Optuna tuned
 
----
+### Rule-Based Layer
+| Rule | Purpose |
+|------|---------|
+| EMA 50 | Trend direction filter |
+| ADX > 25 | Trend strength requirement |
+| ATR chop filter | Skip low-volatility markets |
+| RSI range | Prevent exhaustion entries |
+| News risk score | Block/reduce around events |
+| DD control | 5% reduce, 10% halt |
+| Daily loss limit | 1% daily max |
 
-## Exit Conditions
-
-| Exit Type | Condition |
-|-----------|-----------|
-| **Stop Loss** | 2 × ATR from entry |
-| **Take Profit** | 3 × ATR from entry (1.5:1 R:R) |
-| **Time Exit** | Close after 10 bars if no SL/TP hit |
-| **Emergency** | Close all if daily loss reaches 1% |
-
----
-
-## Risk Management
-
-| Parameter | Value |
-|-----------|-------|
-| Risk per trade | 0.5% of equity |
-| Max daily loss | 1% of equity |
-| Position sizing | `(Equity × 0.005) / (2 × ATR)` |
-| Max positions | 1 concurrent |
+### Exit Rules
+| Type | Value |
+|------|-------|
+| Stop Loss | 2 × ATR |
+| Take Profit | 3 × ATR (3:2 R:R) |
+| Trailing Stop | 2.5 × ATR |
+| Time Exit | 10 bars max |
 
 ---
 
-## News Blackout Windows (UTC)
+## Performance (OOS 2022-2026)
 
-- **FOMC days:** 14:00 - 20:00
-- **NFP (1st Friday):** 12:00 - 15:00
-- **CPI/PPI days:** 12:00 - 15:00
-
----
-
-## Weaknesses & Failure Scenarios
-
-### Known Weaknesses
-
-1. **Sideways Markets** - Trend-following fails in prolonged ranges
-2. **Whipsaws** - Price oscillating around EMA 50 causes false signals
-3. **Slippage** - Hourly gaps (especially overnight) may impact fills
-4. **News Spikes** - Static filter may miss unscheduled events
-
-### Critical Failure Scenarios
-
-1. Extended bear market with violent counter-trend rallies
-2. Flash crashes where stops don't fill at expected price
-3. Prolonged low-volatility periods generating no signals
-
-### Mitigations Built-In
-
-- ATR filter reduces trading in dead markets
-- RSI exhaustion filter prevents chasing
-- Time-based exit limits drawdown from stuck trades
-- Daily loss limit prevents catastrophic days
+| Metric | Value |
+|--------|-------|
+| Win Rate | 58.7% |
+| Profit Factor | 3.34 |
+| Max Drawdown | -2.31% |
+| Avg trades/day | 2.3 |
+| LONG WR | 62% |
+| SHORT WR | 56% |
 
 ---
 
@@ -99,24 +57,18 @@ The system waits for a clear trend to establish (price above/below EMA 50), conf
 
 ```
 TradeBot/
-├── config.py          # All tunable parameters
-├── news_calendar.py   # News blackout logic
-├── backtest.py        # Main backtesting engine
-├── strategy_doc.md    # This document
-└── trade_log.csv      # Generated after backtest
+├── config.py              # All parameters
+├── backtest.py            # Backtesting engine
+├── news_manager.py        # News risk scoring
+├── ai_interface.py        # AI interface (future)
+├── data/                  # Market data + news events
+├── ml/
+│   ├── data_loader.py     # Multi-TF data loader
+│   ├── feature_engine.py  # 33-feature engineering
+│   ├── trainer.py         # V3 dual model trainer
+│   ├── predictor.py       # Inference + Kelly sizing
+│   ├── retrain.py         # Rolling retrain + bias test
+│   └── paper_trader.py    # Paper trading logger
+├── tests/
+└── .gitignore
 ```
-
----
-
-## Usage
-
-```bash
-cd /path/to/TradeBot
-python backtest.py
-```
-
-This runs the backtest with synthetic data and outputs:
-- Performance metrics to console
-- Trade log to `trade_log.csv`
-
-For production, replace `generate_sample_data()` with real OHLCV data.
