@@ -13,8 +13,9 @@ from typing import Optional, Dict
 logger = logging.getLogger(__name__)
 
 DEFAULT_PATHS = {
-    'H1': 'data/USATECHIDXUSD60.csv',
+    'M5': 'data/USATECHIDXUSD5.csv',
     'M15': 'data/USATECHIDXUSD15.csv',
+    'H1': 'data/USATECHIDXUSD60.csv',
     'H4': 'data/USATECHIDXUSD240.csv',
     'D1': 'data/USATECHIDXUSD1440.csv',
 }
