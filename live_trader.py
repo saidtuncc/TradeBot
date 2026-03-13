@@ -351,22 +351,30 @@ class LiveTrader:
     # ═══════════════════════════════════════════════════════════════════
 
     def _analyze_h1(self, h1_bars, now):
-        """H1 bar closed → full ML analysis, set strategic direction."""
+        """H1 bar closed → full ensemble analysis, set strategic direction."""
         bar = h1_bars.iloc[-2]
         logger.info("📊 H1 BAR: %s | C=%.2f H=%.2f L=%.2f",
                      bar['datetime'], bar['close'], bar['high'], bar['low'])
 
-        direction, probability = self._get_ml_signal(h1_bars)
+        # Try ensemble first (H1+M15+M5)
+        direction, probability, details = self._get_ensemble_signal(h1_bars)
 
         if direction:
             self.h1_direction = direction
             self.h1_probability = probability
             self.h1_signal_time = now
-            logger.info("  🎯 H1 DIRECTION: %s (prob=%.3f)", direction.upper(), probability)
+
+            # Log agreement
+            agree_count = sum(1 for k, v in details.items()
+                            if k.endswith(f'_{direction}') and not k.startswith('ensemble') and v > 0.5)
+            logger.info("  🎯 ENSEMBLE: %s (prob=%.3f, %d/3 agree)",
+                         direction.upper(), probability, agree_count)
+            for k, v in sorted(details.items()):
+                logger.info("    %s: %.3f", k, v)
         else:
             self.h1_direction = None
             self.h1_probability = 0.0
-            logger.info("  H1: No clear direction")
+            logger.info("  Ensemble: No clear direction")
 
     # ═══════════════════════════════════════════════════════════════════
     # M15 TACTICAL ENTRY/EXIT
@@ -399,7 +407,34 @@ class LiveTrader:
             elif score >= 3.0:
                 news_scale = 0.5
 
-        # Need H1 direction
+        # M15 model signal (replaces simple RSI heuristic)
+        m15_direction = None
+        m15_prob = 0.0
+        if self.predictor and 'm15' in self.predictor.timeframes:
+            m15_feats = self._build_tf_features(m15_bars, 'm15')
+            if m15_feats is not None:
+                m15_long = self.predictor.predict_single('m15', 'long', m15_feats)
+                m15_short = self.predictor.predict_single('m15', 'short', m15_feats)
+                if m15_long > 0.55:
+                    m15_direction = 'long'
+                    m15_prob = m15_long
+                elif m15_short > 0.55:
+                    m15_direction = 'short'
+                    m15_prob = m15_short
+                logger.info("  🧠 M15 ML: %s (L=%.3f S=%.3f)",
+                             (m15_direction or 'neutral').upper(), m15_long, m15_short)
+
+        # H1 staleness fix: if H1 is >2h old and M15 disagrees strongly
+        if self.h1_signal_time and self.h1_direction:
+            h1_age_hours = (now - self.h1_signal_time).total_seconds() / 3600
+            if h1_age_hours > 2.0 and m15_direction and m15_direction != self.h1_direction and m15_prob > 0.60:
+                logger.warning("  🔄 M15 OVERRIDE: H1=%s (%.1fh old) → M15=%s (prob=%.3f)",
+                                self.h1_direction.upper(), h1_age_hours,
+                                m15_direction.upper(), m15_prob)
+                self.h1_direction = m15_direction
+                self.h1_probability = m15_prob
+
+        # Need direction (H1 or M15 override)
         if self.h1_direction is None:
             return
 
@@ -410,14 +445,19 @@ class LiveTrader:
         direction = self.h1_direction
         probability = self.h1_probability
 
-        # M15 confirmation
+        # M15 confirmation: use model if available, fall back to RSI
         confirmed = False
-        if direction == 'long':
-            if 35 < m15_rsi < 75 and m15_mom > -0.1:
-                confirmed = True
+        if m15_direction:
+            # ML-based confirmation
+            confirmed = (m15_direction == direction)
         else:
-            if 25 < m15_rsi < 65 and m15_mom < 0.1:
-                confirmed = True
+            # Fallback: RSI heuristic
+            if direction == 'long':
+                if 35 < m15_rsi < 75 and m15_mom > -0.1:
+                    confirmed = True
+            else:
+                if 25 < m15_rsi < 65 and m15_mom < 0.1:
+                    confirmed = True
 
         if not confirmed:
             logger.info("  M15 not confirming %s", direction.upper())
@@ -698,14 +738,28 @@ class LiveTrader:
         return False
 
     # ═══════════════════════════════════════════════════════════════════
-    # ML + FEATURE ENGINE
+    # ML + FEATURE ENGINE (ENSEMBLE)
     # ═══════════════════════════════════════════════════════════════════
 
+    def _get_ensemble_signal(self, h1_bars):
+        """Get ensemble signal from H1+M15+M5 models."""
+        if not self.predictor:
+            return None, 0.0, {}
+        try:
+            features_dict = self._build_all_tf_features(h1_bars)
+            if not features_dict:
+                return None, 0.0, {}
+            return self.predictor.predict_ensemble(features_dict)
+        except Exception as e:
+            logger.warning("Ensemble signal error: %s", e)
+            return None, 0.0, {}
+
     def _get_ml_signal(self, bars: pd.DataFrame) -> Tuple[Optional[str], float]:
+        """Backward-compatible H1-only signal."""
         if not self.predictor:
             return None, 0.0
         try:
-            features = self._build_live_features(bars)
+            features = self._build_tf_features(bars, 'h1')
             if features is None or features.empty:
                 return None, 0.0
             return self.predictor.predict_direction(features)
@@ -713,43 +767,101 @@ class LiveTrader:
             logger.warning("ML signal error: %s", e)
             return None, 0.0
 
-    def _build_live_features(self, bars: pd.DataFrame) -> Optional[pd.DataFrame]:
-        """Build ML features from H1 bars + multi-TF."""
+    def _build_all_tf_features(self, h1_bars) -> dict:
+        """Build features for all available timeframes."""
+        features_dict = {}
+
+        # H1 features
+        h1_feats = self._build_tf_features(h1_bars, 'h1')
+        if h1_feats is not None:
+            features_dict['h1'] = h1_feats
+
+        # M15 + M5: fetch from MT5
         try:
             import MetaTrader5 as mt5
-            from ml.feature_engine import build_h1_features, add_higher_tf_features, add_m15_features
+            m15_bars = self.connector.get_bars(mt5.TIMEFRAME_M15, 500)
+            if m15_bars is not None:
+                m15_feats = self._build_tf_features(m15_bars, 'm15')
+                if m15_feats is not None:
+                    features_dict['m15'] = m15_feats
 
+            m5_bars = self.connector.get_bars(mt5.TIMEFRAME_M5, 500)
+            if m5_bars is not None:
+                m5_feats = self._build_tf_features(m5_bars, 'm5')
+                if m5_feats is not None:
+                    features_dict['m5'] = m5_feats
+        except Exception as e:
+            logger.warning("Multi-TF feature error: %s", e)
+
+        return features_dict
+
+    def _build_tf_features(self, bars, timeframe: str) -> Optional[pd.DataFrame]:
+        """Build features for a specific timeframe and align to model's expected features."""
+        try:
             df = bars.copy()
-            df = build_h1_features(df)
+
+            if timeframe == 'h1':
+                from ml.feature_engine import build_h1_features, add_higher_tf_features, add_m15_features
+                df = build_h1_features(df)
+                try:
+                    import MetaTrader5 as mt5
+                    h4_bars = self.connector.get_bars(mt5.TIMEFRAME_H4, 100)
+                    d1_bars = self.connector.get_bars(mt5.TIMEFRAME_D1, 100)
+                    m15_bars = self.connector.get_bars(mt5.TIMEFRAME_M15, 500)
+                    if h4_bars is not None or d1_bars is not None:
+                        df = add_higher_tf_features(df, h4_df=h4_bars, d1_df=d1_bars)
+                    if m15_bars is not None:
+                        df = add_m15_features(df, m15_bars)
+                except Exception:
+                    pass
+
+            elif timeframe == 'm15':
+                from ml.feature_engine import build_m15_features, add_m15_higher_tf
+                df = build_m15_features(df)
+                try:
+                    import MetaTrader5 as mt5
+                    h1_bars = self.connector.get_bars(mt5.TIMEFRAME_H1, 200)
+                    h4_bars = self.connector.get_bars(mt5.TIMEFRAME_H4, 100)
+                    d1_bars = self.connector.get_bars(mt5.TIMEFRAME_D1, 100)
+                    df = add_m15_higher_tf(df, h1_df=h1_bars, h4_df=h4_bars, d1_df=d1_bars)
+                except Exception:
+                    pass
+
+            elif timeframe == 'm5':
+                from ml.feature_engine import build_m5_features, add_m5_higher_tf
+                df = build_m5_features(df)
+                try:
+                    import MetaTrader5 as mt5
+                    h1_bars = self.connector.get_bars(mt5.TIMEFRAME_H1, 200)
+                    m15_bars = self.connector.get_bars(mt5.TIMEFRAME_M15, 500)
+                    df = add_m5_higher_tf(df, h1_df=h1_bars, m15_df=m15_bars)
+                except Exception:
+                    pass
+
             if df.empty:
                 return None
-
-            h4_bars = self.connector.get_bars(mt5.TIMEFRAME_H4, 100)
-            d1_bars = self.connector.get_bars(mt5.TIMEFRAME_D1, 100)
-            m15_bars = self.connector.get_bars(mt5.TIMEFRAME_M15, 500)
-
-            if h4_bars is not None or d1_bars is not None:
-                df = add_higher_tf_features(df, h4_df=h4_bars, d1_df=d1_bars)
-            if m15_bars is not None:
-                df = add_m15_features(df, m15_bars)
 
             last_row = df.iloc[[-1]].copy()
             last_row = last_row.replace([np.inf, -np.inf], 0).fillna(0)
 
+            # Align to model features
+            tf_models = self.predictor.timeframes.get(timeframe, {})
             for direction in ['long', 'short']:
-                selected = self.predictor.models[direction].get('features', [])
-                if selected:
+                bundle = tf_models.get(direction)
+                if bundle and bundle.get('features'):
+                    selected = bundle['features']
                     result = pd.DataFrame(0.0, index=last_row.index, columns=selected)
                     matched = 0
                     for col in selected:
                         if col in last_row.columns:
                             result[col] = last_row[col].values
                             matched += 1
-                    logger.info("  Features: %d/%d matched", matched, len(selected))
                     return result
-            return None
+
+            return last_row
+
         except Exception as e:
-            logger.warning("Feature error: %s", e)
+            logger.warning("Feature build error (%s): %s", timeframe, e)
             return None
 
     # ═══════════════════════════════════════════════════════════════════
