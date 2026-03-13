@@ -202,14 +202,20 @@ class MT5Connector:
 
 class LiveTrader:
     """
-    Multi-TF Real-Time Trading Engine v2.0
+    Multi-TF Real-Time Trading Engine v3.0
 
-    H1  → Strategic direction (ML model)
-    M15 → Tactical entry/exit (RSI + momentum confirmation)
-    M5  → Position management (real-time smart exits)
+    H1  → Strategic direction (ML ensemble)
+    M15 → Tactical entry/exit (ML model confirmation)
+    M5  → Scalp overlay + dynamic position management
 
-    Checks every 30 seconds. No daily trade limit.
+    Features:
+    - Smart kademe (DCA when very confident)
+    - Kademeli çıkış (FIFO, oldest exits first)
+    - M5 scalp overlay (mini trades, even opposite)
+    - Dynamic exits (no SL/TP dependency)
+    - Magic number isolation (ignores manual trades)
     """
+    BOT_MAGIC = 20260312
 
     def __init__(self, connector: MT5Connector, dry_run: bool = False):
         self.connector = connector
@@ -531,6 +537,7 @@ class LiveTrader:
     # ═══════════════════════════════════════════════════════════════════
 
     def _get_all_positions(self) -> list:
+        """Get only BOT positions (magic number filtered)."""
         try:
             positions = self.connector.mt5.positions_get(symbol=self.connector.symbol)
             if not positions:
@@ -543,39 +550,89 @@ class LiveTrader:
                 'sl': p.sl, 'tp': p.tp,
                 'profit': p.profit,
                 'time': datetime.fromtimestamp(p.time),
-            } for p in positions]
+                'magic': p.magic,
+                'comment': p.comment,
+            } for p in positions if p.magic == self.BOT_MAGIC]
         except Exception:
             return []
 
     def _manage_positions(self, positions, h1_bars, m5_bars, now):
-        """Thinking position management — continuously analyze and adapt."""
+        """Smart position management v3 — dynamic exits, kademe, scalp."""
         if not positions:
+            # No positions → check for scalp opportunity
+            self._m5_scalp(m5_bars, h1_bars, positions, now)
             return
 
         max_hold = timedelta(hours=self.config.MAX_BARS_IN_TRADE)
         atr = self._calculate_atr(h1_bars)
         price = float(h1_bars.iloc[-1]['close'])
 
-        # M5 momentum + RSI
-        m5_mom = 0
-        m5_rsi = 50
+        # M5 ML predictions for dynamic management
+        m5_long_prob = 0.5
+        m5_short_prob = 0.5
         if m5_bars is not None and len(m5_bars) > 5:
-            m5_mom = (float(m5_bars.iloc[-1]['close']) / float(m5_bars.iloc[-4]['close']) - 1) * 100
-            m5_rsi = self._calc_rsi(m5_bars['close'], 14)
+            if self.predictor and 'm5' in self.predictor.timeframes:
+                m5_feats = self._build_tf_features(m5_bars, 'm5')
+                if m5_feats is not None:
+                    m5_long_prob = self.predictor.predict_single('m5', 'long', m5_feats)
+                    m5_short_prob = self.predictor.predict_single('m5', 'short', m5_feats)
 
-        for pos in positions:
+        # Sort by open time (oldest first for FIFO exit)
+        positions_sorted = sorted(positions, key=lambda p: p['time'])
+
+        for i, pos in enumerate(positions_sorted):
             hold_h = (now - pos['time']).total_seconds() / 3600
             pnl_pts = (price - pos['price_open']) if pos['type'] == 'long' \
                 else (pos['price_open'] - price)
             pnl_atr = pnl_pts / atr if atr > 0 else 0
+            is_scalp = 'SCALP' in (pos.get('comment', '') or '')
 
-            # ── Time exit (48h max) ──
+            # ══ Scalp positions: tight management ══
+            if is_scalp:
+                if hold_h > 2.0:
+                    logger.info("  ⏰ SCALP TIME: ticket=%d held %.1fh", pos['ticket'], hold_h)
+                    self._close_position(pos, 'SCALP_TIME')
+                    continue
+                if pnl_atr >= 0.8:
+                    logger.info("  💰 SCALP PROFIT: ticket=%d +%.1f ATR", pos['ticket'], pnl_atr)
+                    self._close_position(pos, 'SCALP_PROFIT')
+                    continue
+                if pnl_atr < -0.5:
+                    logger.info("  ✂️ SCALP CUT: ticket=%d %.1f ATR", pos['ticket'], pnl_atr)
+                    self._close_position(pos, 'SCALP_CUT')
+                    continue
+                continue  # Don't apply normal rules to scalps
+
+            # ══ Normal positions: full management ══
+
+            # 1. Time exit (48h max)
             if (now - pos['time']) > max_hold:
                 logger.warning("  ⏰ TIME EXIT: ticket=%d held %.1fh", pos['ticket'], hold_h)
                 self._close_position(pos, 'TIME')
                 continue
 
-            # ── TRAILING STOP: follows price dynamically ──
+            # 2. DYNAMIC PROFIT-TAKE (M5 ML model based)
+            if pnl_atr >= 1.5:
+                m5_against = (pos['type'] == 'long' and m5_short_prob > 0.60) or \
+                             (pos['type'] == 'short' and m5_long_prob > 0.60)
+                if m5_against:
+                    logger.info("  💰 DYNAMIC EXIT: ticket=%d +%.1f ATR (M5 reverse prob=%.2f)",
+                                 pos['ticket'], pnl_atr,
+                                 m5_short_prob if pos['type'] == 'long' else m5_long_prob)
+                    self._close_position(pos, 'DYNAMIC_PROFIT')
+                    continue
+
+            # 3. KADEMELI ÇIKIŞ: oldest position exits at lower target
+            if pnl_atr >= 1.0 and len(positions_sorted) > 1:
+                normal_positions = [p for p in positions_sorted
+                                   if 'SCALP' not in (p.get('comment', '') or '')]
+                if len(normal_positions) > 1 and i == 0:  # Oldest normal position
+                    logger.info("  🎯 FIFO EXIT: oldest ticket=%d +%.1f ATR",
+                                 pos['ticket'], pnl_atr)
+                    self._close_position(pos, 'FIFO_EXIT')
+                    continue
+
+            # 4. TRAILING STOP
             if pnl_atr >= 1.0:
                 if pos['type'] == 'long':
                     new_sl = price - 0.7 * atr
@@ -586,27 +643,26 @@ class LiveTrader:
                     if new_sl < pos['sl'] or pos['sl'] == 0:
                         self._modify_sl(pos, new_sl)
 
-            # ── DYNAMIC TP: extend if ML still confident ──
-            if pnl_atr >= 2.0 and self.h1_direction == pos['type'] and self.h1_probability > 0.65:
+            # 5. BREAKEVEN: move SL to entry when profitable
+            if pnl_atr >= 0.8:
+                if pos['type'] == 'long' and pos['sl'] < pos['price_open']:
+                    self._modify_sl(pos, pos['price_open'] + 0.1 * atr)
+                    logger.info("  🛡️ BREAKEVEN: ticket=%d", pos['ticket'])
+                elif pos['type'] == 'short' and (pos['sl'] > pos['price_open'] or pos['sl'] == 0):
+                    self._modify_sl(pos, pos['price_open'] - 0.1 * atr)
+                    logger.info("  🛡️ BREAKEVEN: ticket=%d", pos['ticket'])
+
+            # 6. DYNAMIC TP EXTEND
+            if pnl_atr >= 2.0 and self.h1_direction == pos['type'] and self.h1_probability > 0.60:
                 new_tp = price + 1.5 * atr if pos['type'] == 'long' else price - 1.5 * atr
                 if pos['type'] == 'long' and new_tp > pos['tp']:
                     self._modify_tp(pos, new_tp)
                 elif pos['type'] == 'short' and new_tp < pos['tp']:
                     self._modify_tp(pos, new_tp)
 
-            # ── PROFIT-TAKING: M5 momentum fading ──
-            if pnl_atr >= 1.5:
-                against = (pos['type'] == 'long' and m5_mom < -0.2 and m5_rsi > 65) or \
-                          (pos['type'] == 'short' and m5_mom > 0.2 and m5_rsi < 35)
-                if against:
-                    logger.info("  💰 PROFIT-TAKE: ticket=%d +%.1f ATR (M5 fading)",
-                                 pos['ticket'], pnl_atr)
-                    self._close_position(pos, 'PROFIT_TAKE')
-                    continue
-
-            # ── LOSING: think about exit or hold ──
-            if pnl_atr < -0.5:
-                # ML switched direction → exit
+            # 7. LOSING MANAGEMENT
+            if pnl_atr < -0.3:
+                # Ensemble yön değiştirdi → çık
                 if self.h1_direction and self.h1_direction != pos['type']:
                     logger.warning("  🔄 SMART EXIT: ticket=%d %s->ML=%s (loss=%.1f ATR)",
                                     pos['ticket'], pos['type'].upper(),
@@ -617,26 +673,169 @@ class LiveTrader:
                     self._close_position(pos, 'SMART_EXIT')
                     continue
 
-                # M5 strongly against + big loss
-                against = (pos['type'] == 'long' and m5_mom < -0.3) or \
-                          (pos['type'] == 'short' and m5_mom > 0.3)
-                if against and pnl_atr < -1.0:
-                    logger.warning("  📉 M5 EXIT: ticket=%d M5=%.2f%% loss=%.1f ATR",
-                                    pos['ticket'], m5_mom, pnl_atr)
+                # M5 strongly against + moderate loss
+                m5_against = (pos['type'] == 'long' and m5_short_prob > 0.65) or \
+                             (pos['type'] == 'short' and m5_long_prob > 0.65)
+                if m5_against and pnl_atr < -0.8:
+                    logger.warning("  📉 M5 EXIT: ticket=%d M5 reverse, loss=%.1f ATR",
+                                    pos['ticket'], pnl_atr)
                     self._close_position(pos, 'M5_EXIT')
                     continue
 
-                # Deep loss + no clear direction → cut
+                # Deep loss + no direction
                 if pnl_atr < -1.5 and self.h1_direction is None:
                     logger.warning("  📉 DEEP LOSS: ticket=%d loss=%.1f ATR",
                                     pos['ticket'], pnl_atr)
                     self._close_position(pos, 'DEEP_LOSS')
                     continue
 
-                # ML still agrees → hold, log thinking
+                # ML still agrees → hold
                 if self.h1_direction == pos['type']:
-                    logger.info("  🧠 HOLD: ticket=%d ML still %s, loss=%.1f ATR",
+                    logger.info("  🧠 HOLD: ticket=%d ML still %s (loss=%.1f ATR)",
                                  pos['ticket'], pos['type'].upper(), pnl_atr)
+
+        # Smart kademe check
+        self._smart_kademe(positions, h1_bars, m5_bars, price, atr, now)
+
+        # M5 scalp overlay
+        self._m5_scalp(m5_bars, h1_bars, positions, now)
+
+    def _smart_kademe(self, positions, h1_bars, m5_bars, price, atr, now):
+        """Analiz eminse zararda da kademe al. Max 3 layer."""
+        if not self.h1_direction or not self.predictor:
+            return
+
+        direction = self.h1_direction
+        same = [p for p in positions if p['type'] == direction
+                and 'SCALP' not in (p.get('comment', '') or '')]
+
+        if len(same) >= 3 or len(same) == 0:
+            return
+
+        # Cooldown: 30 min since last
+        newest = max(same, key=lambda p: p['time'])
+        if (now - newest['time']).total_seconds() < 1800:
+            return
+
+        # Need price dip of 0.5 ATR from average entry
+        avg_entry = sum(p['price_open'] for p in same) / len(same)
+        if direction == 'long' and price > avg_entry - 0.5 * atr:
+            return
+        if direction == 'short' and price < avg_entry + 0.5 * atr:
+            return
+
+        # Must be VERY confident (prob > 0.60)
+        if self.h1_probability < 0.60:
+            return
+
+        # M15 must also agree
+        m15_agrees = False
+        if 'm15' in self.predictor.timeframes:
+            try:
+                import MetaTrader5 as mt5
+                m15_bars = self.connector.get_bars(mt5.TIMEFRAME_M15, 500)
+                if m15_bars is not None:
+                    m15_feats = self._build_tf_features(m15_bars, 'm15')
+                    if m15_feats is not None:
+                        prob = self.predictor.predict_single('m15', direction, m15_feats)
+                        m15_agrees = prob > 0.55
+            except Exception:
+                pass
+
+        if not m15_agrees:
+            return
+
+        layer = len(same)
+        volume = max(round(VOLUME * (0.8 ** layer), 2), VOLUME)
+        logger.info("  🟢 KADEME %d: %s %.2f lots (prob=%.3f, dip=%.1f ATR)",
+                     layer + 1, direction.upper(), volume,
+                     self.h1_probability, abs(price - avg_entry) / atr)
+
+        self._execute_trade(direction, self.h1_probability, price, h1_bars,
+                            True, layer, 1.0)
+
+    def _m5_scalp(self, m5_bars, h1_bars, positions, now):
+        """M5 model based scalp: short-term mini trades."""
+        if m5_bars is None or len(m5_bars) < 20:
+            return
+        if not self.predictor or 'm5' not in self.predictor.timeframes:
+            return
+
+        # Max 1 active scalp
+        scalps = [p for p in positions if 'SCALP' in (p.get('comment', '') or '')]
+        if len(scalps) >= 1:
+            return
+
+        if len(positions) >= self.config.MAX_CONCURRENT_POSITIONS:
+            return
+
+        m5_feats = self._build_tf_features(m5_bars, 'm5')
+        if m5_feats is None:
+            return
+
+        m5_long = self.predictor.predict_single('m5', 'long', m5_feats)
+        m5_short = self.predictor.predict_single('m5', 'short', m5_feats)
+
+        scalp_dir = None
+        scalp_prob = 0.0
+        if m5_long > 0.65:
+            scalp_dir = 'long'
+            scalp_prob = m5_long
+        elif m5_short > 0.65:
+            scalp_dir = 'short'
+            scalp_prob = m5_short
+
+        if not scalp_dir:
+            return
+
+        price = float(m5_bars.iloc[-1]['close'])
+        atr = self._calculate_atr(h1_bars)
+
+        if scalp_dir == 'long':
+            sl = price - 0.75 * atr
+            tp = price + 1.0 * atr
+        else:
+            sl = price + 0.75 * atr
+            tp = price - 1.0 * atr
+
+        volume = max(round(VOLUME * 0.5, 2), VOLUME)
+
+        logger.info("  ⚡ SCALP: %s %.2f lots (M5=%.3f) SL=%.2f TP=%.2f",
+                     scalp_dir.upper(), volume, scalp_prob, sl, tp)
+
+        if self.dry_run:
+            logger.info("  🔸 DRY: Would SCALP %s %.2f @ %.2f",
+                         scalp_dir.upper(), volume, price)
+            self._log_signal(scalp_dir, scalp_prob, price, sl, tp, volume, 'DRY_SCALP')
+        else:
+            import MetaTrader5 as mt5
+            order_type = mt5.ORDER_TYPE_BUY if scalp_dir == 'long' else mt5.ORDER_TYPE_SELL
+            tick = mt5.symbol_info_tick(self.connector.symbol)
+            fill_price = tick.ask if scalp_dir == 'long' else tick.bid
+
+            request = {
+                "action": mt5.TRADE_ACTION_DEAL,
+                "symbol": self.connector.symbol,
+                "volume": volume,
+                "type": order_type,
+                "price": fill_price,
+                "sl": sl, "tp": tp,
+                "deviation": 20,
+                "magic": self.BOT_MAGIC,
+                "comment": f"TradeBot SCALP {scalp_dir.upper()}",
+                "type_time": mt5.ORDER_TIME_GTC,
+                "type_filling": mt5.ORDER_FILLING_IOC,
+            }
+
+            result = mt5.order_send(request)
+            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                logger.info("  ✅ SCALP: %s %.2f @ %.2f ticket=%d",
+                             scalp_dir.upper(), volume, fill_price, result.order)
+                if self.telegram:
+                    self.telegram.notify_order(scalp_dir, volume, fill_price, sl, tp,
+                                               result.order, 'SCALP')
+
+
 
 
 
@@ -697,45 +896,14 @@ class LiveTrader:
                     pos['type'], pos['ticket'], pos['profit'], reason)
 
     def _should_pyramid(self, same_pos, bars, direction, probability=0):
-        """Thinking pyramiding — confidence-based, allows loss pyramiding if very confident."""
+        """Placeholder — kademe logic moved to _smart_kademe."""
         if not self.config.PYRAMIDING_ENABLED:
             return False
-        if len(same_pos) > self.config.PYRAMID_MAX_LAYERS:
+        if len(same_pos) >= 3:
             return False
-
-        import config
-        threshold = getattr(config, 'ML_LONG_THRESHOLD', 0.22) if direction == 'long' \
-            else getattr(config, 'ML_SHORT_THRESHOLD', 0.35)
-
-        atr = self._calculate_atr(bars)
-        price = float(bars.iloc[-2]['close'])
-
-        # Check position health
-        any_deep_loss = False
-        for pos in same_pos:
-            u = (price - pos['price_open']) if pos['type'] == 'long' \
-                else (pos['price_open'] - price)
-            if u < -2.0 * atr:
-                any_deep_loss = True
-
-        # Very confident → pyramid even in moderate loss
-        if probability >= threshold + 0.15:
-            if not any_deep_loss:  # Not deeper than -2 ATR
-                logger.info("  ✅ Confident pyramid (prob=%.3f >> %.3f)", probability, threshold)
-                return True
-
-        # Normal pyramid: needs higher threshold and no losses
-        if probability >= threshold + 0.10:
-            all_ok = all(
-                ((price - p['price_open']) if p['type'] == 'long' else (p['price_open'] - price)) > -0.5 * atr
-                for p in same_pos
-            )
-            if all_ok:
-                logger.info("  ✅ Pyramid OK (prob=%.3f, positions healthy)", probability)
-                return True
-
-        logger.info("  Pyramid skip: prob=%.3f, threshold=%.3f", probability, threshold + 0.10)
-        return False
+        if probability < 0.60:
+            return False
+        return True
 
     # ═══════════════════════════════════════════════════════════════════
     # ML + FEATURE ENGINE (ENSEMBLE)
