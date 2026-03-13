@@ -539,3 +539,195 @@ def build_full_m5_set(base_dir: str = '.') -> pd.DataFrame:
 
     return m5
 
+
+# =========================================================================
+# M15 FEATURE ENGINE (Tactical Entry — between M5 and H1)
+# =========================================================================
+
+def build_m15_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Generate M15-based features. Tactical entry/exit model.
+    More thorough than M5 — sits between scalp and strategic timeframes.
+    ~50 features covering momentum, trend, volatility, microstructure.
+    """
+    out = df.copy()
+    c, h, l, o, v = out['close'], out['high'], out['low'], out['open'], out['volume']
+
+    # --- Returns (7): 15min to 24h in M15 bars ---
+    # 1 bar=15min, 4=1h, 8=2h, 16=4h, 32=8h, 64=16h, 96=24h
+    for bars in [1, 4, 8, 16, 32, 64, 96]:
+        out[f'return_{bars}b'] = c.pct_change(bars) * 100
+
+    # --- Lag returns (4): recent bar-by-bar context ---
+    out['return_lag1'] = out['return_1b'].shift(1)
+    out['return_lag2'] = out['return_1b'].shift(2)
+    out['return_lag3'] = out['return_1b'].shift(3)
+    out['return_lag4'] = out['return_1b'].shift(4)
+
+    # --- Trend (7) ---
+    out['ema10'] = calculate_ema(c, 10)
+    out['ema20'] = calculate_ema(c, 20)
+    out['ema50'] = calculate_ema(c, 50)
+    out['ema100'] = calculate_ema(c, 100)
+    out['ema_spread_10_50'] = (out['ema10'] - out['ema50']) / out['ema50'] * 100
+    out['ema_spread_20_100'] = (out['ema20'] - out['ema100']) / out['ema100'] * 100
+    out['ema_slope_10'] = out['ema50'].pct_change(10) * 100
+    out['ema10_20_cross'] = ((out['ema10'] > out['ema20']).astype(int) -
+                              (out['ema10'] < out['ema20']).astype(int))
+
+    # --- Momentum (10): multi-scale RSI + MACD + Stochastic ---
+    out['rsi7'] = calculate_rsi(c, 7)
+    out['rsi14'] = calculate_rsi(c, 14)
+    out['rsi21'] = calculate_rsi(c, 21)
+    out['rsi_divergence'] = out['rsi7'] - out['rsi21']
+
+    macd, macd_sig, macd_hist = calculate_macd(c, fast=10, slow=26, signal=7)
+    out['macd'] = macd
+    out['macd_signal'] = macd_sig
+    out['macd_hist'] = macd_hist
+
+    stoch_k, stoch_d = calculate_stochastic(h, l, c, k_period=14, d_period=3)
+    out['stoch_k'] = stoch_k
+    out['stoch_d'] = stoch_d
+
+    # --- Volatility (6) ---
+    out['atr14'] = calculate_atr(h, l, c, 14)
+    out['atr_avg50'] = out['atr14'].rolling(50).mean()
+    out['atr_ratio'] = out['atr14'] / out['atr_avg50']
+    out['atr_slope'] = out['atr14'].pct_change(5) * 100  # Volatility expanding/contracting
+
+    bb_width, bb_pctb = calculate_bollinger(c, period=20, std_mult=2.0)
+    out['bb_width'] = bb_width
+    out['bb_pctb'] = bb_pctb
+
+    # --- Candle patterns (5) ---
+    body = (c - o).abs()
+    full_range = (h - l).replace(0, np.nan)
+    out['body_ratio'] = body / full_range
+    out['upper_wick_pct'] = (h - pd.concat([c, o], axis=1).max(axis=1)) / full_range
+    out['lower_wick_pct'] = (pd.concat([c, o], axis=1).min(axis=1) - l) / full_range
+    out['gap'] = (o - c.shift(1)) / c.shift(1) * 100
+    out['candle_dir'] = np.sign(c - o)  # 1=bullish, -1=bearish
+
+    # --- ADX (4) ---
+    adx, plus_di, minus_di = calculate_adx(h, l, c, 14)
+    out['adx'] = adx
+    out['plus_di'] = plus_di
+    out['minus_di'] = minus_di
+    out['adx_trend'] = adx.diff(5)
+
+    # --- Volume (3) ---
+    out['obv_zscore'] = calculate_obv(c, v)
+    out['volume_ratio'] = v / v.rolling(20).mean()
+    out['volume_trend'] = v.rolling(5).mean() / v.rolling(20).mean()  # Volume momentum
+
+    # --- Time (4) ---
+    if 'datetime' in out.columns:
+        dt = pd.to_datetime(out['datetime'])
+        out['hour_sin'] = np.sin(2 * np.pi * dt.dt.hour / 24)
+        out['hour_cos'] = np.cos(2 * np.pi * dt.dt.hour / 24)
+        out['dow_sin'] = np.sin(2 * np.pi * dt.dt.dayofweek / 5)
+        out['dow_cos'] = np.cos(2 * np.pi * dt.dt.dayofweek / 5)
+
+    # --- M15-specific: microstructure (5) ---
+    out['bar_speed'] = (c - o) / out['atr14']
+    out['range_position'] = (c - l) / full_range  # Where close sits in bar range
+    out['high_low_ratio'] = full_range / out['atr14']  # Bar range vs ATR
+
+    # Consecutive direction: how many bars in a row same direction
+    direction = np.sign(c - o)
+    consec = direction.copy()
+    for i in range(1, len(consec)):
+        if direction.iloc[i] == direction.iloc[i-1] and direction.iloc[i] != 0:
+            consec.iloc[i] = consec.iloc[i-1] + np.sign(consec.iloc[i-1])
+    out['consecutive_dir'] = consec
+
+    # Rolling max drawdown (16 bars = 4 hours)
+    rolling_max = c.rolling(16).max()
+    out['drawdown_4h'] = (c - rolling_max) / rolling_max * 100
+
+    n_features = len([col for col in out.columns
+                      if col not in ['datetime', 'open', 'high', 'low', 'close', 'volume']])
+    logger.info("Generated %d M15 features", n_features)
+    return out
+
+
+def add_m15_higher_tf(m15_df: pd.DataFrame, h1_df=None, h4_df=None, d1_df=None) -> pd.DataFrame:
+    """Add H1, H4, D1 context to M15 bars. Rich cross-TF context."""
+    from ml.data_loader import merge_higher_tf_features
+    result = m15_df.copy()
+
+    if h1_df is not None:
+        h1 = h1_df.copy()
+        h1_c = h1.set_index('datetime')['close']
+        h1['h1_ema20'] = calculate_ema(h1_c, 20).values
+        h1['h1_rsi14'] = calculate_rsi(h1_c, 14).values
+        h1_atr = calculate_atr(h1.set_index('datetime')['high'],
+                               h1.set_index('datetime')['low'], h1_c, 14)
+        h1['h1_atr14'] = h1_atr.values
+        h1['h1_trend'] = (h1_c > h1['h1_ema20'].values).astype(int).values
+        h1['h1_momentum'] = h1_c.pct_change(5).values * 100
+        h1['h1_rsi_slope'] = h1['h1_rsi14'].diff(3).values  # RSI direction
+        h1_features = h1[['datetime', 'h1_rsi14', 'h1_trend', 'h1_atr14',
+                           'h1_momentum', 'h1_rsi_slope']].dropna()
+        result = merge_higher_tf_features(result, h1_features)
+        logger.info("Added 5 H1 context features to M15")
+
+    if h4_df is not None:
+        h4 = h4_df.copy()
+        h4_c = h4.set_index('datetime')['close']
+        h4['h4_rsi14'] = calculate_rsi(h4_c, 14).values
+        h4['h4_trend'] = (h4_c > calculate_ema(h4_c, 20).values).astype(int).values
+        h4['h4_momentum'] = h4_c.pct_change(5).values * 100
+        h4_features = h4[['datetime', 'h4_rsi14', 'h4_trend', 'h4_momentum']].dropna()
+        result = merge_higher_tf_features(result, h4_features)
+        logger.info("Added 3 H4 context features to M15")
+
+    if d1_df is not None:
+        d1 = d1_df.copy()
+        d1_c = d1.set_index('datetime')['close']
+        d1['d1_trend'] = (d1_c > calculate_ema(d1_c, 20).values).astype(int).values
+        d1['d1_return_5d'] = d1_c.pct_change(5).values * 100
+        d1_features = d1[['datetime', 'd1_trend', 'd1_return_5d']].dropna()
+        result = merge_higher_tf_features(result, d1_features)
+        logger.info("Added 2 D1 context features to M15")
+
+    return result
+
+
+def build_full_m15_set(base_dir: str = '.') -> pd.DataFrame:
+    """
+    Full M15 feature pipeline:
+    1. M15 base indicators (50+ features)
+    2. H1 + H4 + D1 cross-timeframe context (10 features)
+    3. Triple-barrier labeling (tactical: tp/sl=2.0 ATR, max 16 bars = 4h)
+    """
+    from ml.data_loader import load_all_timeframes
+
+    logger.info("=== Building M15 Feature Set ===")
+    data = load_all_timeframes(base_dir)
+
+    if 'M15' not in data:
+        raise FileNotFoundError("M15 data not found")
+
+    m15 = build_m15_features(data['M15'])
+    m15 = add_m15_higher_tf(m15, h1_df=data.get('H1'), h4_df=data.get('H4'),
+                            d1_df=data.get('D1'))
+
+    # Triple-barrier: tactical (wider than M5, same as H1)
+    m15 = triple_barrier_label(m15, tp_atr_mult=2.0, sl_atr_mult=2.0, max_bars=16)
+
+    # Fill cross-TF NaN
+    htf_cols = [c for c in m15.columns if c.startswith(('h1_', 'h4_', 'd1_'))]
+    for col in htf_cols:
+        m15[col] = m15[col].fillna(0)
+
+    # Drop warm-up NaN
+    before = len(m15)
+    m15 = m15.dropna(subset=[c for c in m15.columns if c not in
+                             ['target_reason', 'target_pnl_ratio'] + htf_cols])
+    logger.info("M15: Dropped %d warm-up rows, final: %d rows", before - len(m15), len(m15))
+
+    return m15
+
+
