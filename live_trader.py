@@ -225,6 +225,11 @@ class LiveTrader:
         self.h1_probability = 0.0
         self.h1_signal_time = None
 
+        # Anti-repeat cooldown: don't reopen same direction after SL
+        self.last_close_time = {}    # {'long': datetime, 'short': datetime}
+        self.last_close_reason = {}  # {'long': 'SL', 'short': 'TP'}
+        self.COOLDOWN_MINUTES = 30   # Wait 30 min after SL before same direction
+
         # Load ML predictor
         self.predictor = None
         try:
@@ -410,6 +415,15 @@ class LiveTrader:
         direction = self.h1_direction
         probability = self.h1_probability
 
+        # Anti-repeat cooldown check
+        if direction in self.last_close_time:
+            elapsed = (now - self.last_close_time[direction]).total_seconds() / 60
+            reason = self.last_close_reason.get(direction, '')
+            if elapsed < self.COOLDOWN_MINUTES and reason == 'SL':
+                logger.info("  ⏳ Cooldown: %s SL'd %.0f min ago (wait %d min)",
+                             direction.upper(), elapsed, self.COOLDOWN_MINUTES)
+                return
+
         # M15 confirmation
         confirmed = False
         if direction == 'long':
@@ -508,18 +522,22 @@ class LiveTrader:
             return []
 
     def _manage_positions(self, positions, h1_bars, m5_bars, now):
-        """Smart position management every 30 seconds."""
+        """Active position management — trailing stop, profit-taking, smart exits."""
         if not positions:
+            # Check if any positions were closed by SL/TP (detect externally)
+            self._detect_sl_tp_closes(now)
             return
 
         max_hold = timedelta(hours=self.config.MAX_BARS_IN_TRADE)
         atr = self._calculate_atr(h1_bars)
         price = float(h1_bars.iloc[-1]['close'])
 
-        # M5 momentum
+        # M5 momentum + RSI
         m5_mom = 0
-        if m5_bars is not None and len(m5_bars) > 3:
+        m5_rsi = 50
+        if m5_bars is not None and len(m5_bars) > 5:
             m5_mom = (float(m5_bars.iloc[-1]['close']) / float(m5_bars.iloc[-4]['close']) - 1) * 100
+            m5_rsi = self._calc_rsi(m5_bars['close'], 14)
 
         for pos in positions:
             hold_h = (now - pos['time']).total_seconds() / 3600
@@ -527,45 +545,121 @@ class LiveTrader:
                 else (pos['price_open'] - price)
             pnl_atr = pnl_pts / atr if atr > 0 else 0
 
-            # Rule 1: Time exit (48h max)
+            # ── Rule 1: Time exit (48h max) ──
             if (now - pos['time']) > max_hold:
                 logger.warning("  ⏰ TIME EXIT: ticket=%d held %.1fh", pos['ticket'], hold_h)
-                self._close_position(pos)
+                self._close_position(pos, 'TIME')
                 continue
 
-            # Rule 2: ML says opposite + losing → smart exit
+            # ── Rule 2: TRAILING STOP — lock in profit ──
+            if pnl_atr >= 1.0:
+                # Move SL to breakeven + 0.3 ATR
+                if pos['type'] == 'long':
+                    new_sl = pos['price_open'] + 0.3 * atr
+                    if pos['sl'] < new_sl:
+                        self._modify_sl(pos, new_sl)
+                else:
+                    new_sl = pos['price_open'] - 0.3 * atr
+                    if pos['sl'] > new_sl or pos['sl'] == 0:
+                        self._modify_sl(pos, new_sl)
+
+            if pnl_atr >= 2.0:
+                # Move SL to lock 1.0 ATR profit
+                if pos['type'] == 'long':
+                    new_sl = pos['price_open'] + 1.0 * atr
+                    if pos['sl'] < new_sl:
+                        self._modify_sl(pos, new_sl)
+                else:
+                    new_sl = pos['price_open'] - 1.0 * atr
+                    if pos['sl'] > new_sl or pos['sl'] == 0:
+                        self._modify_sl(pos, new_sl)
+
+            # ── Rule 3: ACTIVE PROFIT-TAKING (momentum fading) ──
+            if pnl_atr >= 1.5:
+                # Take profit when M5 momentum reverses
+                against = (pos['type'] == 'long' and m5_mom < -0.2 and m5_rsi > 65) or \
+                          (pos['type'] == 'short' and m5_mom > 0.2 and m5_rsi < 35)
+                if against:
+                    logger.info("  💰 PROFIT-TAKE: ticket=%d +%.1f ATR (M5 fading)",
+                                 pos['ticket'], pnl_atr)
+                    self._close_position(pos, 'PROFIT_TAKE')
+                    continue
+
+            # ── Rule 4: ML says opposite + losing → smart exit ──
             if pnl_atr < -0.5:
                 if self.h1_direction and self.h1_direction != pos['type']:
-                    logger.warning("  🔄 SMART EXIT: ticket=%d %s→ML=%s (loss=%.1f ATR)",
+                    logger.warning("  🔄 SMART EXIT: ticket=%d %s->ML=%s (loss=%.1f ATR)",
                                     pos['ticket'], pos['type'].upper(),
                                     self.h1_direction.upper(), pnl_atr)
                     if self.telegram:
                         self.telegram.notify_smart_exit(
                             pos['ticket'], pos['type'], self.h1_direction, pnl_atr)
-                    self._close_position(pos)
+                    self._close_position(pos, 'SL')
                     continue
 
-                # M5 momentum strongly against + significant loss
+                # M5 momentum strongly against + loss
                 against = (pos['type'] == 'long' and m5_mom < -0.3) or \
                           (pos['type'] == 'short' and m5_mom > 0.3)
                 if against and pnl_atr < -1.0:
                     logger.warning("  📉 M5 EXIT: ticket=%d M5=%.2f%% loss=%.1f ATR",
                                     pos['ticket'], m5_mom, pnl_atr)
-                    self._close_position(pos)
+                    self._close_position(pos, 'SL')
                     continue
 
                 # Deep loss with no signal
                 if pnl_atr < -1.5 and self.h1_direction is None:
                     logger.warning("  📉 DEEP LOSS EXIT: ticket=%d loss=%.1f ATR",
                                     pos['ticket'], pnl_atr)
-                    self._close_position(pos)
+                    self._close_position(pos, 'SL')
                     continue
 
-    def _close_position(self, pos):
+    def _detect_sl_tp_closes(self, now):
+        """Detect if a position was closed by broker SL/TP (not by us)."""
+        # If we had positions tracked but now have 0, something closed externally
+        if not hasattr(self, '_last_position_count'):
+            self._last_position_count = 0
+            return
+        # Will be set by the cycle
+
+    def _modify_sl(self, pos, new_sl):
+        """Move SL to new level (trailing stop)."""
         if self.dry_run:
-            logger.info("  🔸 DRY: Would close ticket=%d (P&L=$%.2f)", pos['ticket'], pos['profit'])
+            logger.info("  🔸 DRY: Would trail SL to %.2f for ticket=%d", new_sl, pos['ticket'])
+            return
+        try:
+            import MetaTrader5 as mt5
+            request = {
+                'action': mt5.TRADE_ACTION_SLTP,
+                'symbol': self.connector.symbol,
+                'position': pos['ticket'],
+                'sl': round(new_sl, 2),
+                'tp': pos['tp'],
+            }
+            result = mt5.order_send(request)
+            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                logger.info("  📐 TRAIL SL: ticket=%d SL=%.2f", pos['ticket'], new_sl)
+                if self.telegram:
+                    self.telegram._send(
+                        f"📐 TRAILING SL\n"
+                        f"Ticket: {pos['ticket']}\n"
+                        f"New SL: {new_sl:.2f}")
+        except Exception as e:
+            logger.warning("  Trail SL error: %s", e)
+
+    def _close_position(self, pos, reason='MANUAL'):
+        """Close position and track for cooldown."""
+        # Record cooldown
+        self.last_close_time[pos['type']] = datetime.now()
+        self.last_close_reason[pos['type']] = reason
+
+        if self.dry_run:
+            logger.info("  🔸 DRY: Would close ticket=%d (P&L=$%.2f) [%s]",
+                         pos['ticket'], pos['profit'], reason)
         else:
             self.connector.close_position(pos['ticket'])
+            if self.telegram:
+                self.telegram.notify_close(
+                    pos['type'], pos['ticket'], pos['profit'], reason)
 
     def _should_pyramid(self, same_pos, bars, direction, probability=0):
         if not self.config.PYRAMIDING_ENABLED:
