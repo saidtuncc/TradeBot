@@ -598,8 +598,8 @@ class LiveTrader:
                     logger.info("  🧠 HOLD: ticket=%d ML still %s, loss=%.1f ATR",
                                  pos['ticket'], pos['type'].upper(), pnl_atr)
 
-    def _detect_sl_tp_closes(self, now):
-        pass
+
+
 
     def _modify_sl(self, pos, new_sl):
         """Move SL dynamically."""
