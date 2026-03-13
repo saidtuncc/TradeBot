@@ -92,8 +92,8 @@ def _train_and_save(train_df, test_df, target_col, model_name):
     X_test_sel = X_test[selected]
 
     # --- Step 2: Optuna tuning (100 trials) ---
-    logger.info("Step 2: Optuna hyperparameter search (100 trials)...")
-    best_params = _optuna_tune(X_train_sel, y_train, n_trials=100)
+    logger.info("Step 2: Optuna hyperparameter search (200 trials)...")
+    best_params = _optuna_tune(X_train_sel, y_train, n_trials=200)
     logger.info("Best params: %s", best_params)
 
     # --- Step 3: Train final model ---

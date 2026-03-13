@@ -553,9 +553,9 @@ def build_m15_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
     c, h, l, o, v = out['close'], out['high'], out['low'], out['open'], out['volume']
 
-    # --- Returns (7): 15min to 24h in M15 bars ---
-    # 1 bar=15min, 4=1h, 8=2h, 16=4h, 32=8h, 64=16h, 96=24h
-    for bars in [1, 4, 8, 16, 32, 64, 96]:
+    # --- Returns (9): 15min to 72h in M15 bars ---
+    # 1=15min, 4=1h, 8=2h, 16=4h, 32=8h, 64=16h, 96=24h, 192=48h, 288=72h
+    for bars in [1, 4, 8, 16, 32, 64, 96, 192, 288]:
         out[f'return_{bars}b'] = c.pct_change(bars) * 100
 
     # --- Lag returns (4): recent bar-by-bar context ---
@@ -646,6 +646,15 @@ def build_m15_features(df: pd.DataFrame) -> pd.DataFrame:
     rolling_max = c.rolling(16).max()
     out['drawdown_4h'] = (c - rolling_max) / rolling_max * 100
 
+    # --- News proximity (2): distance to key economic hours ---
+    if 'datetime' in out.columns:
+        dt = pd.to_datetime(out['datetime'])
+        hour = dt.dt.hour
+        # Major US data releases: 15:30 TR (8:30 ET), 17:00 TR (10:00 ET)
+        out['dist_to_us_open'] = ((hour - 16.5) % 24).clip(0, 12) / 12  # 0=at open, 1=far
+        # Is this a high-volume period? (US market 16:30-23:00 TR)
+        out['us_session'] = ((hour >= 16) & (hour <= 23)).astype(int)
+
     n_features = len([col for col in out.columns
                       if col not in ['datetime', 'open', 'high', 'low', 'close', 'volume']])
     logger.info("Generated %d M15 features", n_features)
@@ -714,8 +723,8 @@ def build_full_m15_set(base_dir: str = '.') -> pd.DataFrame:
     m15 = add_m15_higher_tf(m15, h1_df=data.get('H1'), h4_df=data.get('H4'),
                             d1_df=data.get('D1'))
 
-    # Triple-barrier: tactical (wider than M5, same as H1)
-    m15 = triple_barrier_label(m15, tp_atr_mult=2.0, sl_atr_mult=2.0, max_bars=16)
+    # Triple-barrier: tactical (1.5 ATR for cleaner labels, 4h max hold)
+    m15 = triple_barrier_label(m15, tp_atr_mult=1.5, sl_atr_mult=1.5, max_bars=16)
 
     # Fill cross-TF NaN
     htf_cols = [c for c in m15.columns if c.startswith(('h1_', 'h4_', 'd1_'))]
