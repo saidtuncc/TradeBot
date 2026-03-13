@@ -225,11 +225,6 @@ class LiveTrader:
         self.h1_probability = 0.0
         self.h1_signal_time = None
 
-        # Anti-repeat cooldown: don't reopen same direction after SL
-        self.last_close_time = {}    # {'long': datetime, 'short': datetime}
-        self.last_close_reason = {}  # {'long': 'SL', 'short': 'TP'}
-        self.COOLDOWN_MINUTES = 30   # Wait 30 min after SL before same direction
-
         # Load ML predictor
         self.predictor = None
         try:
@@ -415,15 +410,6 @@ class LiveTrader:
         direction = self.h1_direction
         probability = self.h1_probability
 
-        # Anti-repeat cooldown check
-        if direction in self.last_close_time:
-            elapsed = (now - self.last_close_time[direction]).total_seconds() / 60
-            reason = self.last_close_reason.get(direction, '')
-            if elapsed < self.COOLDOWN_MINUTES and reason == 'SL':
-                logger.info("  ⏳ Cooldown: %s SL'd %.0f min ago (wait %d min)",
-                             direction.upper(), elapsed, self.COOLDOWN_MINUTES)
-                return
-
         # M15 confirmation
         confirmed = False
         if direction == 'long':
@@ -522,10 +508,8 @@ class LiveTrader:
             return []
 
     def _manage_positions(self, positions, h1_bars, m5_bars, now):
-        """Active position management — trailing stop, profit-taking, smart exits."""
+        """Thinking position management — continuously analyze and adapt."""
         if not positions:
-            # Check if any positions were closed by SL/TP (detect externally)
-            self._detect_sl_tp_closes(now)
             return
 
         max_hold = timedelta(hours=self.config.MAX_BARS_IN_TRADE)
@@ -545,38 +529,33 @@ class LiveTrader:
                 else (pos['price_open'] - price)
             pnl_atr = pnl_pts / atr if atr > 0 else 0
 
-            # ── Rule 1: Time exit (48h max) ──
+            # ── Time exit (48h max) ──
             if (now - pos['time']) > max_hold:
                 logger.warning("  ⏰ TIME EXIT: ticket=%d held %.1fh", pos['ticket'], hold_h)
                 self._close_position(pos, 'TIME')
                 continue
 
-            # ── Rule 2: TRAILING STOP — lock in profit ──
+            # ── TRAILING STOP: follows price dynamically ──
             if pnl_atr >= 1.0:
-                # Move SL to breakeven + 0.3 ATR
                 if pos['type'] == 'long':
-                    new_sl = pos['price_open'] + 0.3 * atr
-                    if pos['sl'] < new_sl:
+                    new_sl = price - 0.7 * atr
+                    if new_sl > pos['sl']:
                         self._modify_sl(pos, new_sl)
                 else:
-                    new_sl = pos['price_open'] - 0.3 * atr
-                    if pos['sl'] > new_sl or pos['sl'] == 0:
+                    new_sl = price + 0.7 * atr
+                    if new_sl < pos['sl'] or pos['sl'] == 0:
                         self._modify_sl(pos, new_sl)
 
-            if pnl_atr >= 2.0:
-                # Move SL to lock 1.0 ATR profit
-                if pos['type'] == 'long':
-                    new_sl = pos['price_open'] + 1.0 * atr
-                    if pos['sl'] < new_sl:
-                        self._modify_sl(pos, new_sl)
-                else:
-                    new_sl = pos['price_open'] - 1.0 * atr
-                    if pos['sl'] > new_sl or pos['sl'] == 0:
-                        self._modify_sl(pos, new_sl)
+            # ── DYNAMIC TP: extend if ML still confident ──
+            if pnl_atr >= 2.0 and self.h1_direction == pos['type'] and self.h1_probability > 0.65:
+                new_tp = price + 1.5 * atr if pos['type'] == 'long' else price - 1.5 * atr
+                if pos['type'] == 'long' and new_tp > pos['tp']:
+                    self._modify_tp(pos, new_tp)
+                elif pos['type'] == 'short' and new_tp < pos['tp']:
+                    self._modify_tp(pos, new_tp)
 
-            # ── Rule 3: ACTIVE PROFIT-TAKING (momentum fading) ──
+            # ── PROFIT-TAKING: M5 momentum fading ──
             if pnl_atr >= 1.5:
-                # Take profit when M5 momentum reverses
                 against = (pos['type'] == 'long' and m5_mom < -0.2 and m5_rsi > 65) or \
                           (pos['type'] == 'short' and m5_mom > 0.2 and m5_rsi < 35)
                 if against:
@@ -585,8 +564,9 @@ class LiveTrader:
                     self._close_position(pos, 'PROFIT_TAKE')
                     continue
 
-            # ── Rule 4: ML says opposite + losing → smart exit ──
+            # ── LOSING: think about exit or hold ──
             if pnl_atr < -0.5:
+                # ML switched direction → exit
                 if self.h1_direction and self.h1_direction != pos['type']:
                     logger.warning("  🔄 SMART EXIT: ticket=%d %s->ML=%s (loss=%.1f ATR)",
                                     pos['ticket'], pos['type'].upper(),
@@ -594,37 +574,37 @@ class LiveTrader:
                     if self.telegram:
                         self.telegram.notify_smart_exit(
                             pos['ticket'], pos['type'], self.h1_direction, pnl_atr)
-                    self._close_position(pos, 'SL')
+                    self._close_position(pos, 'SMART_EXIT')
                     continue
 
-                # M5 momentum strongly against + loss
+                # M5 strongly against + big loss
                 against = (pos['type'] == 'long' and m5_mom < -0.3) or \
                           (pos['type'] == 'short' and m5_mom > 0.3)
                 if against and pnl_atr < -1.0:
                     logger.warning("  📉 M5 EXIT: ticket=%d M5=%.2f%% loss=%.1f ATR",
                                     pos['ticket'], m5_mom, pnl_atr)
-                    self._close_position(pos, 'SL')
+                    self._close_position(pos, 'M5_EXIT')
                     continue
 
-                # Deep loss with no signal
+                # Deep loss + no clear direction → cut
                 if pnl_atr < -1.5 and self.h1_direction is None:
-                    logger.warning("  📉 DEEP LOSS EXIT: ticket=%d loss=%.1f ATR",
+                    logger.warning("  📉 DEEP LOSS: ticket=%d loss=%.1f ATR",
                                     pos['ticket'], pnl_atr)
-                    self._close_position(pos, 'SL')
+                    self._close_position(pos, 'DEEP_LOSS')
                     continue
+
+                # ML still agrees → hold, log thinking
+                if self.h1_direction == pos['type']:
+                    logger.info("  🧠 HOLD: ticket=%d ML still %s, loss=%.1f ATR",
+                                 pos['ticket'], pos['type'].upper(), pnl_atr)
 
     def _detect_sl_tp_closes(self, now):
-        """Detect if a position was closed by broker SL/TP (not by us)."""
-        # If we had positions tracked but now have 0, something closed externally
-        if not hasattr(self, '_last_position_count'):
-            self._last_position_count = 0
-            return
-        # Will be set by the cycle
+        pass
 
     def _modify_sl(self, pos, new_sl):
-        """Move SL to new level (trailing stop)."""
+        """Move SL dynamically."""
         if self.dry_run:
-            logger.info("  🔸 DRY: Would trail SL to %.2f for ticket=%d", new_sl, pos['ticket'])
+            logger.info("  🔸 DRY: Trail SL to %.2f for ticket=%d", new_sl, pos['ticket'])
             return
         try:
             import MetaTrader5 as mt5
@@ -637,23 +617,38 @@ class LiveTrader:
             }
             result = mt5.order_send(request)
             if result and result.retcode == mt5.TRADE_RETCODE_DONE:
-                logger.info("  📐 TRAIL SL: ticket=%d SL=%.2f", pos['ticket'], new_sl)
+                logger.info("  📐 SL updated: ticket=%d SL=%.2f", pos['ticket'], new_sl)
                 if self.telegram:
-                    self.telegram._send(
-                        f"📐 TRAILING SL\n"
-                        f"Ticket: {pos['ticket']}\n"
-                        f"New SL: {new_sl:.2f}")
+                    self.telegram._send(f"📐 SL: {pos['ticket']} -> {new_sl:.2f}")
         except Exception as e:
-            logger.warning("  Trail SL error: %s", e)
+            logger.warning("  SL modify error: %s", e)
+
+    def _modify_tp(self, pos, new_tp):
+        """Extend TP when trend is strong."""
+        if self.dry_run:
+            logger.info("  🔸 DRY: Move TP to %.2f for ticket=%d", new_tp, pos['ticket'])
+            return
+        try:
+            import MetaTrader5 as mt5
+            request = {
+                'action': mt5.TRADE_ACTION_SLTP,
+                'symbol': self.connector.symbol,
+                'position': pos['ticket'],
+                'sl': pos['sl'],
+                'tp': round(new_tp, 2),
+            }
+            result = mt5.order_send(request)
+            if result and result.retcode == mt5.TRADE_RETCODE_DONE:
+                logger.info("  🎯 TP extended: ticket=%d TP=%.2f", pos['ticket'], new_tp)
+                if self.telegram:
+                    self.telegram._send(f"🎯 TP: {pos['ticket']} -> {new_tp:.2f}")
+        except Exception as e:
+            logger.warning("  TP modify error: %s", e)
 
     def _close_position(self, pos, reason='MANUAL'):
-        """Close position and track for cooldown."""
-        # Record cooldown
-        self.last_close_time[pos['type']] = datetime.now()
-        self.last_close_reason[pos['type']] = reason
-
+        """Close position with Telegram notification."""
         if self.dry_run:
-            logger.info("  🔸 DRY: Would close ticket=%d (P&L=$%.2f) [%s]",
+            logger.info("  🔸 DRY: Close ticket=%d (P&L=$%.2f) [%s]",
                          pos['ticket'], pos['profit'], reason)
         else:
             self.connector.close_position(pos['ticket'])
@@ -662,6 +657,7 @@ class LiveTrader:
                     pos['type'], pos['ticket'], pos['profit'], reason)
 
     def _should_pyramid(self, same_pos, bars, direction, probability=0):
+        """Thinking pyramiding — confidence-based, allows loss pyramiding if very confident."""
         if not self.config.PYRAMIDING_ENABLED:
             return False
         if len(same_pos) > self.config.PYRAMID_MAX_LAYERS:
@@ -671,20 +667,35 @@ class LiveTrader:
         threshold = getattr(config, 'ML_LONG_THRESHOLD', 0.22) if direction == 'long' \
             else getattr(config, 'ML_SHORT_THRESHOLD', 0.35)
 
-        if probability < threshold + 0.10:
-            logger.info("  Pyramid skip: prob=%.3f < %.3f", probability, threshold + 0.10)
-            return False
-
         atr = self._calculate_atr(bars)
         price = float(bars.iloc[-2]['close'])
+
+        # Check position health
+        any_deep_loss = False
         for pos in same_pos:
             u = (price - pos['price_open']) if pos['type'] == 'long' \
                 else (pos['price_open'] - price)
-            if u < -1.5 * atr:
-                return False
+            if u < -2.0 * atr:
+                any_deep_loss = True
 
-        logger.info("  ✅ Pyramid OK (prob=%.3f)", probability)
-        return True
+        # Very confident → pyramid even in moderate loss
+        if probability >= threshold + 0.15:
+            if not any_deep_loss:  # Not deeper than -2 ATR
+                logger.info("  ✅ Confident pyramid (prob=%.3f >> %.3f)", probability, threshold)
+                return True
+
+        # Normal pyramid: needs higher threshold and no losses
+        if probability >= threshold + 0.10:
+            all_ok = all(
+                ((price - p['price_open']) if p['type'] == 'long' else (p['price_open'] - price)) > -0.5 * atr
+                for p in same_pos
+            )
+            if all_ok:
+                logger.info("  ✅ Pyramid OK (prob=%.3f, positions healthy)", probability)
+                return True
+
+        logger.info("  Pyramid skip: prob=%.3f, threshold=%.3f", probability, threshold + 0.10)
+        return False
 
     # ═══════════════════════════════════════════════════════════════════
     # ML + FEATURE ENGINE
