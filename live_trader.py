@@ -377,6 +377,10 @@ class LiveTrader:
                          direction.upper(), probability, agree_count)
             for k, v in sorted(details.items()):
                 logger.info("    %s: %.3f", k, v)
+
+            # Telegram: ensemble signal notification
+            if self.telegram:
+                self.telegram.notify_ensemble(direction, probability, details)
         else:
             self.h1_direction = None
             self.h1_probability = 0.0
@@ -746,10 +750,16 @@ class LiveTrader:
             return
 
         layer = len(same)
+        dip_atr = abs(price - avg_entry) / atr
         volume = max(round(VOLUME * (0.8 ** layer), 2), VOLUME)
         logger.info("  🟢 KADEME %d: %s %.2f lots (prob=%.3f, dip=%.1f ATR)",
                      layer + 1, direction.upper(), volume,
-                     self.h1_probability, abs(price - avg_entry) / atr)
+                     self.h1_probability, dip_atr)
+
+        # Telegram: kademe notification
+        if self.telegram:
+            self.telegram.notify_kademe(direction, layer + 1, volume,
+                                        self.h1_probability, dip_atr)
 
         self._execute_trade(direction, self.h1_probability, price, h1_bars,
                             True, layer, 1.0)
@@ -889,6 +899,9 @@ class LiveTrader:
         if self.dry_run:
             logger.info("  🔸 DRY: Close ticket=%d (P&L=$%.2f) [%s]",
                          pos['ticket'], pos['profit'], reason)
+            if self.telegram:
+                self.telegram.notify_close(
+                    pos['type'], pos['ticket'], pos['profit'], reason)
         else:
             self.connector.close_position(pos['ticket'])
             if self.telegram:
